@@ -3203,6 +3203,15 @@ extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
         if !lock.visible || lock.show_in_progress || lock.closed.load(Ordering::Acquire) {
             return;
         }
+        if lock.overlay_renderer.is_none() {
+            // Acquiring a Metal drawable inside Core Animation's display commit
+            // can wait for a drawable held by that same transaction. Reuse the
+            // existing source (which arms frame_requested) to submit afterward.
+            if lock.request_frame_callback.is_some() {
+                lock.start_display_link();
+            }
+            return;
+        }
         if let Some(mut callback) = lock.request_frame_callback.take() {
             lock.set_presents_with_transaction(true);
             lock.stop_display_link();

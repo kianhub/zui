@@ -573,15 +573,11 @@ impl MetalRenderer {
         }
     }
 
-    /// Finish rendering before publishing the drawable into the layer's
-    /// transaction. Used only when showing a hidden, prewarmed window; normal
-    /// frames continue to submit asynchronously.
+    /// Finish rendering before showing a hidden, prewarmed window. Keep the
+    /// caller's presentation mode so native overlays retain transaction
+    /// atomicity; the window lifecycle flushes Core Animation before showing.
     pub fn draw_and_wait(&mut self, scene: &Scene) -> Result<()> {
-        let presents_with_transaction = self.presents_with_transaction;
-        self.set_presents_with_transaction(true);
-        let result = objc::rc::autoreleasepool(|| self.draw_frame(scene, true));
-        self.set_presents_with_transaction(presents_with_transaction);
-        result
+        objc::rc::autoreleasepool(|| self.draw_frame(scene, true))
     }
 
     fn draw_frame(&mut self, scene: &Scene, wait_for_completion: bool) -> Result<()> {
