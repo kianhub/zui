@@ -13,6 +13,9 @@ use std::{
 };
 
 pub mod arc_cow;
+mod guard;
+
+pub use guard::{GuardedDrop, guarded_callback};
 
 #[cfg(target_os = "windows")]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000_u32;

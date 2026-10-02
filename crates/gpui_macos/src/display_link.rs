@@ -55,7 +55,7 @@ use core_graphics::display::CGDirectDisplayID;
 use dispatch2::{
     _dispatch_source_type_data_add, DispatchObject, DispatchQueue, DispatchRetained, DispatchSource,
 };
-use gpui_util::ResultExt;
+use gpui_util::{ResultExt, guarded_callback};
 use std::{
     collections::{BTreeMap, btree_map},
     ffi::c_void,
@@ -131,16 +131,18 @@ unsafe extern "C" fn display_link_output_callback(
     _flags_out: *mut i64,
     display_id: *mut c_void,
 ) -> i32 {
-    let display_id = display_id as usize as CGDirectDisplayID;
-    let registry = lock_registry();
-    if let Some(entry) = registry.displays.get(&display_id) {
-        for (_, frame_requests, requested) in &entry.subscribers {
-            if requested.load(Ordering::Acquire) {
-                frame_requests.merge_data(1);
+    guarded_callback(0, || {
+        let display_id = display_id as usize as CGDirectDisplayID;
+        let registry = lock_registry();
+        if let Some(entry) = registry.displays.get(&display_id) {
+            for (_, frame_requests, requested) in &entry.subscribers {
+                if requested.load(Ordering::Acquire) {
+                    frame_requests.merge_data(1);
+                }
             }
         }
-    }
-    0
+        0
+    })
 }
 
 fn subscribe(

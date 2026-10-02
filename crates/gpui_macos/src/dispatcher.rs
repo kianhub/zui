@@ -1,6 +1,6 @@
 use dispatch2::{DispatchQueue, DispatchQueueGlobalPriority, DispatchTime, GlobalQueueIdentifier};
 use gpui::{PlatformDispatcher, Priority, RunnableMeta, RunnableVariant};
-use gpui_util::ResultExt;
+use gpui_util::{ResultExt, guarded_callback};
 use mach2::{
     kern_return::KERN_SUCCESS,
     mach_time::mach_timebase_info_data_t,
@@ -164,12 +164,15 @@ fn set_audio_thread_priority() -> anyhow::Result<()> {
 }
 
 extern "C" fn trampoline(context: *mut c_void) {
-    let runnable =
-        unsafe { Runnable::<RunnableMeta>::from_raw(NonNull::new_unchecked(context as *mut ())) };
+    guarded_callback((), || {
+        let runnable = unsafe {
+            Runnable::<RunnableMeta>::from_raw(NonNull::new_unchecked(context as *mut ()))
+        };
 
-    let location = runnable.metadata().location;
-    let spawned = runnable.metadata().spawned;
-    gpui::profiler::update_running_task(spawned, location);
-    runnable.run();
-    gpui::profiler::save_task_timing();
+        let location = runnable.metadata().location;
+        let spawned = runnable.metadata().spawned;
+        gpui::profiler::update_running_task(spawned, location);
+        runnable.run();
+        gpui::profiler::save_task_timing();
+    })
 }

@@ -38,7 +38,7 @@ use gpui::{
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
 };
-use gpui_util::{ResultExt, new_std_command};
+use gpui_util::{GuardedDrop, ResultExt, guarded_callback, new_std_command};
 use itertools::Itertools;
 use objc::{
     class,
@@ -73,101 +73,104 @@ static mut APP_DELEGATE_CLASS: *const Class = ptr::null();
 
 #[ctor(unsafe)]
 unsafe fn build_classes() {
-    unsafe {
-        APP_CLASS = {
-            let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
-            decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
-            decl.register()
+    guarded_callback((), || {
+        unsafe {
+            APP_CLASS = {
+                let mut decl = ClassDecl::new("GPUIApplication", class!(NSApplication)).unwrap();
+                decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
+                decl.register()
+            }
+        };
+        unsafe {
+            APP_DELEGATE_CLASS = {
+                let mut decl =
+                    ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
+                decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
+                decl.add_method(
+                    sel!(applicationWillFinishLaunching:),
+                    will_finish_launching as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(applicationDidFinishLaunching:),
+                    did_finish_launching as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(applicationShouldHandleReopen:hasVisibleWindows:),
+                    should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool) -> bool,
+                );
+                decl.add_method(
+                    sel!(applicationWillTerminate:),
+                    will_terminate as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(handleGPUIMenuItem:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                // Add menu item handlers so that OS save panels have the correct key commands
+                decl.add_method(
+                    sel!(cut:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(copy:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(paste:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(selectAll:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(undo:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(redo:),
+                    handle_menu_item as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(validateMenuItem:),
+                    validate_menu_item as extern "C" fn(&mut Object, Sel, id) -> bool,
+                );
+                decl.add_method(
+                    sel!(menuWillOpen:),
+                    menu_will_open as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(applicationDockMenu:),
+                    handle_dock_menu as extern "C" fn(&mut Object, Sel, id) -> id,
+                );
+                decl.add_method(
+                    sel!(application:openURLs:),
+                    open_urls as extern "C" fn(&mut Object, Sel, id, id),
+                );
+
+                decl.add_method(
+                    sel!(onKeyboardLayoutChange:),
+                    on_keyboard_layout_change as extern "C" fn(&mut Object, Sel, id),
+                );
+
+                decl.add_method(
+                    sel!(onThermalStateChange:),
+                    on_thermal_state_change as extern "C" fn(&mut Object, Sel, id),
+                );
+
+                decl.add_method(
+                    sel!(onSystemWake:),
+                    on_system_wake as extern "C" fn(&mut Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(onFrameSourceWake:),
+                    on_frame_source_wake as extern "C" fn(&mut Object, Sel, id),
+                );
+
+                decl.register()
+            }
         }
-    };
-    unsafe {
-        APP_DELEGATE_CLASS = {
-            let mut decl = ClassDecl::new("GPUIApplicationDelegate", class!(NSResponder)).unwrap();
-            decl.add_ivar::<*mut c_void>(MAC_PLATFORM_IVAR);
-            decl.add_method(
-                sel!(applicationWillFinishLaunching:),
-                will_finish_launching as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(applicationDidFinishLaunching:),
-                did_finish_launching as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(applicationShouldHandleReopen:hasVisibleWindows:),
-                should_handle_reopen as extern "C" fn(&mut Object, Sel, id, bool),
-            );
-            decl.add_method(
-                sel!(applicationWillTerminate:),
-                will_terminate as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(handleGPUIMenuItem:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            // Add menu item handlers so that OS save panels have the correct key commands
-            decl.add_method(
-                sel!(cut:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(copy:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(paste:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(selectAll:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(undo:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(redo:),
-                handle_menu_item as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(validateMenuItem:),
-                validate_menu_item as extern "C" fn(&mut Object, Sel, id) -> bool,
-            );
-            decl.add_method(
-                sel!(menuWillOpen:),
-                menu_will_open as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(applicationDockMenu:),
-                handle_dock_menu as extern "C" fn(&mut Object, Sel, id) -> id,
-            );
-            decl.add_method(
-                sel!(application:openURLs:),
-                open_urls as extern "C" fn(&mut Object, Sel, id, id),
-            );
-
-            decl.add_method(
-                sel!(onKeyboardLayoutChange:),
-                on_keyboard_layout_change as extern "C" fn(&mut Object, Sel, id),
-            );
-
-            decl.add_method(
-                sel!(onThermalStateChange:),
-                on_thermal_state_change as extern "C" fn(&mut Object, Sel, id),
-            );
-
-            decl.add_method(
-                sel!(onSystemWake:),
-                on_system_wake as extern "C" fn(&mut Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(onFrameSourceWake:),
-                on_frame_source_wake as extern "C" fn(&mut Object, Sel, id),
-            );
-
-            decl.register()
-        }
-    }
+    })
 }
 
 pub struct MacPlatform(Mutex<MacPlatformState>);
@@ -513,8 +516,19 @@ impl Platform for MacPlatform {
         }
 
         unsafe {
+            // Constructor panics are contained; incomplete class registration
+            // must stop startup before a nil native object can be dereferenced.
+            if APP_CLASS.is_null() || APP_DELEGATE_CLASS.is_null() {
+                log::error!("macOS application classes failed to initialize");
+                return;
+            }
             let app: id = msg_send![APP_CLASS, sharedApplication];
             let app_delegate: id = msg_send![APP_DELEGATE_CLASS, new];
+            if app.is_null() || app_delegate.is_null() {
+                let _: () = msg_send![app_delegate, release];
+                log::error!("failed to create macOS application or delegate");
+                return;
+            }
             app.setDelegate_(app_delegate);
 
             let self_ptr = self as *const Self as *const c_void;
@@ -543,10 +557,10 @@ impl Platform for MacPlatform {
         }
 
         extern "C" fn quit(_: *mut c_void) {
-            unsafe {
+            guarded_callback((), || unsafe {
                 let app = NSApplication::sharedApplication(nil);
                 let _: () = msg_send![app, terminate: nil];
-            }
+            })
         }
     }
 
@@ -680,7 +694,7 @@ impl Platform for MacPlatform {
             foreground_executor,
             background_executor,
             renderer_context,
-        )))
+        )?))
     }
 
     fn window_appearance(&self) -> WindowAppearance {
@@ -732,18 +746,20 @@ impl Platform for MacPlatform {
                     "Cannot register URL scheme until app is installed"
                 )));
             }
-            let done_tx = Cell::new(Some(done_tx));
+            let done_tx = GuardedDrop::new(Cell::new(Some(done_tx)));
             let block = ConcreteBlock::new(move |error: id| {
-                let result = if error == nil {
-                    Ok(())
-                } else {
-                    let msg: id = msg_send![error, localizedDescription];
-                    Err(anyhow!("Failed to register: {msg:?}"))
-                };
+                guarded_callback((), || {
+                    let result = if error == nil {
+                        Ok(())
+                    } else {
+                        let msg: id = msg_send![error, localizedDescription];
+                        Err(anyhow!("Failed to register: {msg:?}"))
+                    };
 
-                if let Some(done_tx) = done_tx.take() {
-                    let _ = done_tx.send(result);
-                }
+                    if let Some(done_tx) = done_tx.take() {
+                        let _ = done_tx.send(result);
+                    }
+                })
             });
             let block = block.copy();
             let _: () = msg_send![workspace, setDefaultApplicationAtURL: app toOpenURLsWithScheme: scheme completionHandler: block];
@@ -772,27 +788,29 @@ impl Platform for MacPlatform {
 
                     panel.setCanCreateDirectories(true.to_objc());
                     panel.setResolvesAliases_(false.to_objc());
-                    let done_tx = Cell::new(Some(done_tx));
+                    let done_tx = GuardedDrop::new(Cell::new(Some(done_tx)));
                     let block = ConcreteBlock::new(move |response: NSModalResponse| {
-                        let result = if response == NSModalResponse::NSModalResponseOk {
-                            let mut result = Vec::new();
-                            let urls = panel.URLs();
-                            for i in 0..urls.count() {
-                                let url = urls.objectAtIndex(i);
-                                if url.isFileURL() == YES
-                                    && let Ok(path) = ns_url_to_path(url)
-                                {
-                                    result.push(path)
+                        guarded_callback((), || {
+                            let result = if response == NSModalResponse::NSModalResponseOk {
+                                let mut result = Vec::new();
+                                let urls = panel.URLs();
+                                for i in 0..urls.count() {
+                                    let url = urls.objectAtIndex(i);
+                                    if url.isFileURL() == YES
+                                        && let Ok(path) = ns_url_to_path(url)
+                                    {
+                                        result.push(path)
+                                    }
                                 }
-                            }
-                            Some(result)
-                        } else {
-                            None
-                        };
+                                Some(result)
+                            } else {
+                                None
+                            };
 
-                        if let Some(done_tx) = done_tx.take() {
-                            let _ = done_tx.send(Ok(result));
-                        }
+                            if let Some(done_tx) = done_tx.take() {
+                                let _ = done_tx.send(Ok(result));
+                            }
+                        })
                     });
                     let block = block.copy();
 
@@ -828,47 +846,49 @@ impl Platform for MacPlatform {
                         let _: () = msg_send![panel, setNameFieldStringValue: name_string];
                     }
 
-                    let done_tx = Cell::new(Some(done_tx));
+                    let done_tx = GuardedDrop::new(Cell::new(Some(done_tx)));
                     let block = ConcreteBlock::new(move |response: NSModalResponse| {
-                        let mut result = None;
-                        if response == NSModalResponse::NSModalResponseOk {
-                            let url = panel.URL();
-                            if url.isFileURL() == YES {
-                                result = ns_url_to_path(panel.URL()).ok().map(|mut result| {
-                                    let Some(filename) = result.file_name() else {
-                                        return result;
-                                    };
-                                    let chunks = filename
-                                        .as_bytes()
-                                        .split(|&b| b == b'.')
-                                        .collect::<Vec<_>>();
+                        guarded_callback((), || {
+                            let mut result = None;
+                            if response == NSModalResponse::NSModalResponseOk {
+                                let url = panel.URL();
+                                if url.isFileURL() == YES {
+                                    result = ns_url_to_path(panel.URL()).ok().map(|mut result| {
+                                        let Some(filename) = result.file_name() else {
+                                            return result;
+                                        };
+                                        let chunks = filename
+                                            .as_bytes()
+                                            .split(|&b| b == b'.')
+                                            .collect::<Vec<_>>();
 
-                                    // https://github.com/zed-industries/zed/issues/16969
-                                    // Workaround a bug in macOS Sequoia that adds an extra file-extension
-                                    // sometimes. e.g. `a.sql` becomes `a.sql.s` or `a.txtx` becomes `a.txtx.txt`
-                                    //
-                                    // This is conditional on OS version because I'd like to get rid of it, so that
-                                    // you can manually create a file called `a.sql.s`. That said it seems better
-                                    // to break that use-case than breaking `a.sql`.
-                                    if chunks.len() == 3
-                                        && chunks[1].starts_with(chunks[2])
-                                        && Self::os_version() >= Version::new(15, 0, 0)
-                                    {
-                                        let new_filename = OsStr::from_bytes(
-                                            &filename.as_bytes()
-                                                [..chunks[0].len() + 1 + chunks[1].len()],
-                                        )
-                                        .to_owned();
-                                        result.set_file_name(&new_filename);
-                                    }
-                                    result
-                                })
+                                        // https://github.com/zed-industries/zed/issues/16969
+                                        // Workaround a bug in macOS Sequoia that adds an extra file-extension
+                                        // sometimes. e.g. `a.sql` becomes `a.sql.s` or `a.txtx` becomes `a.txtx.txt`
+                                        //
+                                        // This is conditional on OS version because I'd like to get rid of it, so that
+                                        // you can manually create a file called `a.sql.s`. That said it seems better
+                                        // to break that use-case than breaking `a.sql`.
+                                        if chunks.len() == 3
+                                            && chunks[1].starts_with(chunks[2])
+                                            && Self::os_version() >= Version::new(15, 0, 0)
+                                        {
+                                            let new_filename = OsStr::from_bytes(
+                                                &filename.as_bytes()
+                                                    [..chunks[0].len() + 1 + chunks[1].len()],
+                                            )
+                                            .to_owned();
+                                            result.set_file_name(&new_filename);
+                                        }
+                                        result
+                                    })
+                                }
                             }
-                        }
 
-                        if let Some(done_tx) = done_tx.take() {
-                            let _ = done_tx.send(Ok(result));
-                        }
+                            if let Some(done_tx) = done_tx.take() {
+                                let _ = done_tx.send(Ok(result));
+                            }
+                        })
                     });
                     let block = block.copy();
                     let _: () = msg_send![panel, beginWithCompletionHandler: block];
@@ -1245,24 +1265,26 @@ unsafe fn get_mac_platform(object: &mut Object) -> &MacPlatform {
 }
 
 extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
-    unsafe {
-        let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
+    guarded_callback((), || {
+        unsafe {
+            let user_defaults: id = msg_send![class!(NSUserDefaults), standardUserDefaults];
 
-        // The autofill heuristic controller causes slowdown and high CPU usage.
-        // We don't know exactly why. This disables the full heuristic controller.
-        //
-        // Adapted from: https://github.com/ghostty-org/ghostty/pull/8625
-        let name = ns_string("NSAutoFillHeuristicControllerEnabled");
-        let existing_value: id = msg_send![user_defaults, objectForKey: name];
-        if existing_value == nil {
-            let false_value: id = msg_send![class!(NSNumber), numberWithBool:false];
-            let _: () = msg_send![user_defaults, setObject: false_value forKey: name];
+            // The autofill heuristic controller causes slowdown and high CPU usage.
+            // We don't know exactly why. This disables the full heuristic controller.
+            //
+            // Adapted from: https://github.com/ghostty-org/ghostty/pull/8625
+            let name = ns_string("NSAutoFillHeuristicControllerEnabled");
+            let existing_value: id = msg_send![user_defaults, objectForKey: name];
+            if existing_value == nil {
+                let false_value: id = msg_send![class!(NSNumber), numberWithBool:false];
+                let _: () = msg_send![user_defaults, setObject: false_value forKey: name];
+            }
         }
-    }
+    })
 }
 
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
         let explicit_policy = get_mac_platform(this).0.lock().activation_policy;
         let policy = match explicit_policy {
@@ -1314,9 +1336,9 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             state.finish_launching.take()
         };
         if let Some(callback) = callback {
-            callback();
+            guarded_callback((), || callback());
         }
-    }
+    })
 }
 
 unsafe fn register_system_wake_observer(observer: id) {
@@ -1347,153 +1369,190 @@ unsafe fn register_system_wake_observer(observer: id) {
     }
 }
 
-extern "C" fn should_handle_reopen(this: &mut Object, _: Sel, _: id, has_open_windows: bool) {
-    if !has_open_windows {
-        let platform = unsafe { get_mac_platform(this) };
-        let mut lock = platform.0.lock();
-        if let Some(mut callback) = lock.reopen.take() {
-            drop(lock);
-            callback();
-            platform.0.lock().reopen.get_or_insert(callback);
+extern "C" fn should_handle_reopen(
+    this: &mut Object,
+    _: Sel,
+    _: id,
+    has_open_windows: bool,
+) -> bool {
+    guarded_callback(false, || {
+        if !has_open_windows {
+            let platform = unsafe { get_mac_platform(this) };
+            let mut lock = platform.0.lock();
+            if let Some(mut callback) = lock.reopen.take() {
+                drop(lock);
+                let completed = guarded_callback(false, || {
+                    callback();
+                    true
+                });
+                platform.0.lock().reopen.get_or_insert(callback);
+                return completed;
+            }
         }
-    }
+        true
+    })
 }
 
 extern "C" fn will_terminate(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.quit.take() {
-        drop(lock);
-        callback();
-        platform.0.lock().quit.get_or_insert(callback);
-    }
+    guarded_callback((), || {
+        let platform = unsafe { get_mac_platform(this) };
+        let mut lock = platform.0.lock();
+        if let Some(mut callback) = lock.quit.take() {
+            drop(lock);
+            guarded_callback((), || callback());
+            platform.0.lock().quit.get_or_insert(callback);
+        }
+    })
 }
 
 extern "C" fn on_keyboard_layout_change(this: &mut Object, _: Sel, _: id) {
-    let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    let keyboard_layout = MacKeyboardLayout::new();
-    lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
-    if let Some(mut callback) = lock.on_keyboard_layout_change.take() {
-        drop(lock);
-        callback();
-        platform
-            .0
-            .lock()
-            .on_keyboard_layout_change
-            .get_or_insert(callback);
-    }
-}
-
-extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
-    // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
-    // as NSNotificationCenter delivers this notification synchronously and it may fire while
-    // the App is already borrowed (same pattern as quit() above).
-    let platform = unsafe { get_mac_platform(this) };
-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
-    unsafe {
-        DispatchQueue::main().exec_async_f(platform_ptr, on_thermal_state_change);
-    }
-
-    extern "C" fn on_thermal_state_change(context: *mut c_void) {
-        let platform = unsafe { &*(context as *const MacPlatform) };
+    guarded_callback((), || {
+        let platform = unsafe { get_mac_platform(this) };
         let mut lock = platform.0.lock();
-        if let Some(mut callback) = lock.on_thermal_state_change.take() {
+        let keyboard_layout = MacKeyboardLayout::new();
+        lock.keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
+        if let Some(mut callback) = lock.on_keyboard_layout_change.take() {
             drop(lock);
-            callback();
+            guarded_callback((), || callback());
             platform
                 .0
                 .lock()
-                .on_thermal_state_change
+                .on_keyboard_layout_change
                 .get_or_insert(callback);
         }
-    }
+    })
+}
+
+extern "C" fn on_thermal_state_change(this: &mut Object, _: Sel, _: id) {
+    guarded_callback((), || {
+        // Defer to the next run loop iteration to avoid re-entrant borrows of the App RefCell,
+        // as NSNotificationCenter delivers this notification synchronously and it may fire while
+        // the App is already borrowed (same pattern as quit() above).
+        let platform = unsafe { get_mac_platform(this) };
+        let platform_ptr = platform as *const MacPlatform as *mut c_void;
+        unsafe {
+            DispatchQueue::main().exec_async_f(platform_ptr, on_thermal_state_change);
+        }
+
+        extern "C" fn on_thermal_state_change(context: *mut c_void) {
+            guarded_callback((), || {
+                let platform = unsafe { &*(context as *const MacPlatform) };
+                let mut lock = platform.0.lock();
+                if let Some(mut callback) = lock.on_thermal_state_change.take() {
+                    drop(lock);
+                    guarded_callback((), || callback());
+                    platform
+                        .0
+                        .lock()
+                        .on_thermal_state_change
+                        .get_or_insert(callback);
+                }
+            })
+        }
+    })
 }
 
 extern "C" fn on_frame_source_wake(_: &mut Object, _: Sel, _: id) {
-    // Do not restart links inside an AppKit callback holding a window lock.
-    unsafe {
-        DispatchQueue::main().exec_async_f(std::ptr::null_mut(), restart);
-    }
-    extern "C" fn restart(_: *mut c_void) {
-        MacWindow::restart_frame_sources();
-    }
+    guarded_callback((), || {
+        // Do not restart links inside an AppKit callback holding a window lock.
+        unsafe {
+            DispatchQueue::main().exec_async_f(std::ptr::null_mut(), restart);
+        }
+        extern "C" fn restart(_: *mut c_void) {
+            guarded_callback((), || {
+                MacWindow::restart_frame_sources();
+            })
+        }
+    })
 }
 
 extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
-    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
-    let platform = unsafe { get_mac_platform(this) };
-    let platform_ptr = platform as *const MacPlatform as *mut c_void;
-    // SAFETY: platform lives for the process lifetime while callbacks are registered.
-    unsafe {
-        DispatchQueue::main().exec_async_f(platform_ptr, on_system_wake);
-    }
-
-    extern "C" fn on_system_wake(context: *mut c_void) {
-        // SAFETY: context is the MacPlatform pointer queued above.
-        let platform = unsafe { &*(context as *const MacPlatform) };
-        let mut lock = platform.0.lock();
-        if let Some(mut callback) = lock.on_system_wake.take() {
-            drop(lock);
-            callback();
-            platform.0.lock().on_system_wake.get_or_insert(callback);
+    guarded_callback((), || {
+        // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+        let platform = unsafe { get_mac_platform(this) };
+        let platform_ptr = platform as *const MacPlatform as *mut c_void;
+        // SAFETY: platform lives for the process lifetime while callbacks are registered.
+        unsafe {
+            DispatchQueue::main().exec_async_f(platform_ptr, on_system_wake);
         }
-    }
+
+        extern "C" fn on_system_wake(context: *mut c_void) {
+            guarded_callback((), || {
+                // SAFETY: context is the MacPlatform pointer queued above.
+                let platform = unsafe { &*(context as *const MacPlatform) };
+                let mut lock = platform.0.lock();
+                if let Some(mut callback) = lock.on_system_wake.take() {
+                    drop(lock);
+                    guarded_callback((), || callback());
+                    platform.0.lock().on_system_wake.get_or_insert(callback);
+                }
+            })
+        }
+    })
 }
 
 extern "C" fn open_urls(this: &mut Object, _: Sel, _: id, urls: id) {
-    let urls = unsafe {
-        (0..urls.count())
-            .filter_map(|i| {
-                let url = urls.objectAtIndex(i);
-                match CStr::from_ptr(url.absoluteString().UTF8String() as *mut c_char).to_str() {
-                    Ok(string) => Some(string.to_string()),
-                    Err(err) => {
-                        log::error!("error converting path to string: {}", err);
-                        None
+    guarded_callback((), || {
+        let urls = unsafe {
+            (0..urls.count())
+                .filter_map(|i| {
+                    let url = urls.objectAtIndex(i);
+                    match CStr::from_ptr(url.absoluteString().UTF8String() as *mut c_char).to_str()
+                    {
+                        Ok(string) => Some(string.to_string()),
+                        Err(err) => {
+                            log::error!("error converting path to string: {}", err);
+                            None
+                        }
                     }
-                }
-            })
-            .collect::<Vec<_>>()
-    };
-    let platform = unsafe { get_mac_platform(this) };
-    let mut lock = platform.0.lock();
-    if let Some(mut callback) = lock.open_urls.take() {
-        drop(lock);
-        callback(urls);
-        platform.0.lock().open_urls.get_or_insert(callback);
-    }
+                })
+                .collect::<Vec<_>>()
+        };
+        let platform = unsafe { get_mac_platform(this) };
+        let mut lock = platform.0.lock();
+        if let Some(mut callback) = lock.open_urls.take() {
+            drop(lock);
+            guarded_callback((), || callback(urls));
+            platform.0.lock().open_urls.get_or_insert(callback);
+        }
+    })
 }
 
 extern "C" fn handle_menu_item(this: &mut Object, _: Sel, item: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let platform = get_mac_platform(this);
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
             let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
-                callback(&*action);
+            let action = lock
+                .menu_actions
+                .get(index)
+                .and_then(|action| guarded_callback(None, || Some(action.boxed_clone())));
+            drop(lock);
+            if let Some(action) = action {
+                guarded_callback((), || callback(&*action));
             }
             platform.0.lock().menu_command.get_or_insert(callback);
         }
-    }
+    })
 }
 
 extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
-    unsafe {
+    guarded_callback(false, || unsafe {
         let mut result = false;
         let platform = get_mac_platform(this);
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.validate_menu_command.take() {
             let tag: NSInteger = msg_send![item, tag];
             let index = tag as usize;
-            if let Some(action) = lock.menu_actions.get(index) {
-                let action = action.boxed_clone();
-                drop(lock);
-                result = callback(action.as_ref());
+            let action = lock
+                .menu_actions
+                .get(index)
+                .and_then(|action| guarded_callback(None, || Some(action.boxed_clone())));
+            drop(lock);
+            if let Some(action) = action {
+                result = guarded_callback(false, || callback(action.as_ref()));
             }
             platform
                 .0
@@ -1502,23 +1561,23 @@ extern "C" fn validate_menu_item(this: &mut Object, _: Sel, item: id) -> bool {
                 .get_or_insert(callback);
         }
         result
-    }
+    })
 }
 
 extern "C" fn menu_will_open(this: &mut Object, _: Sel, _: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let platform = get_mac_platform(this);
         let mut lock = platform.0.lock();
         if let Some(mut callback) = lock.will_open_menu.take() {
             drop(lock);
-            callback();
+            guarded_callback((), || callback());
             platform.0.lock().will_open_menu.get_or_insert(callback);
         }
-    }
+    })
 }
 
 extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
-    unsafe {
+    guarded_callback(nil, || unsafe {
         let platform = get_mac_platform(this);
         let state = platform.0.lock();
         if let Some(id) = state.dock_menu {
@@ -1526,7 +1585,7 @@ extern "C" fn handle_dock_menu(this: &mut Object, _: Sel, _: id) -> id {
         } else {
             nil
         }
-    }
+    })
 }
 
 unsafe fn ns_url_to_path(url: id) -> Result<PathBuf> {

@@ -5,6 +5,7 @@
 //! not-in-a-bundle abort) until the application posts a notification or
 //! registers a response callback.
 
+use gpui_util::{GuardedDrop, guarded_callback};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -92,7 +93,7 @@ impl SystemNotificationState {
                 // about) or replace itself.
                 let taken = callback.borrow_mut().take();
                 if let Some(mut taken) = taken {
-                    taken(response);
+                    guarded_callback((), || taken(response));
                     callback.borrow_mut().get_or_insert(taken);
                 }
             }
@@ -143,16 +144,18 @@ impl NotificationCenter {
             return;
         }
         let completion = RcBlock::new(|granted: Bool, error: *mut NSError| {
-            // SAFETY: when non-null, `error` is a valid `NSError` for the
-            // duration of the callback.
-            if let Some(error) = unsafe { error.as_ref() } {
-                log::warn!(
-                    "system notification authorization failed: {}",
-                    error.localizedDescription()
-                );
-            } else if !granted.as_bool() {
-                log::info!("system notification authorization denied");
-            }
+            guarded_callback((), || {
+                // SAFETY: when non-null, `error` is a valid `NSError` for the
+                // duration of the callback.
+                if let Some(error) = unsafe { error.as_ref() } {
+                    log::warn!(
+                        "system notification authorization failed: {}",
+                        error.localizedDescription()
+                    );
+                } else if !granted.as_bool() {
+                    log::info!("system notification authorization denied");
+                }
+            })
         });
         self.center
             .requestAuthorizationWithOptions_completionHandler(
@@ -181,14 +184,16 @@ impl NotificationCenter {
             None,
         );
         let completion = RcBlock::new(|error: *mut NSError| {
-            // SAFETY: when non-null, `error` is a valid `NSError` for the
-            // duration of the callback.
-            if let Some(error) = unsafe { error.as_ref() } {
-                log::warn!(
-                    "failed to deliver system notification: {}",
-                    error.localizedDescription()
-                );
-            }
+            guarded_callback((), || {
+                // SAFETY: when non-null, `error` is a valid `NSError` for the
+                // duration of the callback.
+                if let Some(error) = unsafe { error.as_ref() } {
+                    log::warn!(
+                        "failed to deliver system notification: {}",
+                        error.localizedDescription()
+                    );
+                }
+            })
         });
         self.center
             .addNotificationRequest_withCompletionHandler(&request, Some(&completion));
@@ -240,7 +245,7 @@ impl NotificationCenter {
 }
 
 struct DelegateIvars {
-    sender: mpsc::UnboundedSender<SystemNotificationResponse>,
+    sender: GuardedDrop<mpsc::UnboundedSender<SystemNotificationResponse>>,
 }
 
 define_class!(
@@ -263,24 +268,27 @@ define_class!(
             response: &UNNotificationResponse,
             completion_handler: &block2::DynBlock<dyn Fn()>,
         ) {
-            let tag = response.notification().request().identifier().to_string();
-            let action = response.actionIdentifier();
-            // The other well-known identifier, `UNNotificationDismissActionIdentifier`,
-            // is only delivered for categories opting into dismiss callbacks,
-            // which we never request.
-            let action_id = if &*action == unsafe { UNNotificationDefaultActionIdentifier } {
-                None
-            } else {
-                Some(SharedString::from(action.to_string()))
-            };
-            self.ivars()
-                .sender
-                .unbounded_send(SystemNotificationResponse {
-                    tag: SharedString::from(tag),
-                    action_id,
-                })
-                .ok();
-            completion_handler.call(());
+            guarded_callback((), || {
+                let tag = response.notification().request().identifier().to_string();
+                let action = response.actionIdentifier();
+                // The other well-known identifier, `UNNotificationDismissActionIdentifier`,
+                // is only delivered for categories opting into dismiss callbacks,
+                // which we never request.
+                let action_id = if &*action == unsafe { UNNotificationDefaultActionIdentifier } {
+                    None
+                } else {
+                    Some(SharedString::from(action.to_string()))
+                };
+                self.ivars()
+                    .sender
+                    .unbounded_send(SystemNotificationResponse {
+                        tag: SharedString::from(tag),
+                        action_id,
+                    })
+                    .ok();
+            });
+            // Complete even if response conversion or a receiver waker panics.
+            guarded_callback((), || completion_handler.call(()));
         }
 
         // Without this, macOS suppresses banners while the app is frontmost.
@@ -293,16 +301,19 @@ define_class!(
             _notification: &UNNotification,
             completion_handler: &block2::DynBlock<dyn Fn(UNNotificationPresentationOptions)>,
         ) {
-            completion_handler
-                .call((UNNotificationPresentationOptions::Banner
-                    | UNNotificationPresentationOptions::List,));
+            guarded_callback((), || {
+                completion_handler.call((UNNotificationPresentationOptions::Banner
+                    | UNNotificationPresentationOptions::List,))
+            });
         }
     }
 );
 
 impl NotificationResponseDelegate {
     fn new(sender: mpsc::UnboundedSender<SystemNotificationResponse>) -> Retained<Self> {
-        let this = Self::alloc().set_ivars(DelegateIvars { sender });
+        let this = Self::alloc().set_ivars(DelegateIvars {
+            sender: GuardedDrop::new(sender),
+        });
         // SAFETY: `NSObject`'s `init` is its designated initializer.
         unsafe { msg_send![super(this), init] }
     }

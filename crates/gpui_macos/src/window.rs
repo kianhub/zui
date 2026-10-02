@@ -4,7 +4,6 @@ use crate::{
     kTISPropertyInputSourceIsASCIICapable, kTISPropertyInputSourceType, kTISTypeKeyboardInputMode,
     ns_string, renderer,
 };
-#[cfg(any(test, feature = "test-support"))]
 use anyhow::Result;
 use block::ConcreteBlock;
 use cocoa::{
@@ -42,7 +41,7 @@ use core_foundation_sys::number::{CFBooleanGetValue, CFBooleanRef};
 use core_graphics::display::{CGDirectDisplayID, CGRect};
 use ctor::ctor;
 use futures::channel::oneshot;
-use gpui_util::ResultExt;
+use gpui_util::{GuardedDrop, ResultExt, guarded_callback};
 use objc::{
     class,
     declare::ClassDecl,
@@ -115,18 +114,22 @@ const NSDragOperationCopy: NSDragOperation = 1;
 // This class uses the same window-state ownership as GPUIView. It does not
 // become a first responder; interactive overlay events go through GPUIView.
 extern "C" fn overlay_hit_test(this: &Object, _: Sel, _: NSPoint) -> id {
-    let active =
-        unsafe { &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool) };
-    if active.load(Ordering::Acquire) {
-        this as *const Object as id
-    } else {
-        nil
-    }
+    guarded_callback(nil, || {
+        let active =
+            unsafe { &*(*this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool) };
+        if active.load(Ordering::Acquire) {
+            this as *const Object as id
+        } else {
+            nil
+        }
+    })
 }
 extern "C" fn overlay_event(this: &Object, selector: Sel, event: id) {
-    let state = unsafe { get_window_state(this) };
-    let view = state.lock().native_view;
-    handle_view_event(unsafe { view.as_ref() }, selector, event);
+    guarded_callback((), || {
+        let state = unsafe { get_window_state(this) };
+        let view = state.lock().native_view;
+        handle_view_event(unsafe { view.as_ref() }, selector, event);
+    })
 }
 
 #[derive(PartialEq)]
@@ -149,254 +152,256 @@ unsafe extern "C" {
 
 #[ctor(unsafe)]
 unsafe fn build_classes() {
-    unsafe {
-        WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
-        PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
-        VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
-            decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
-            decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
+    guarded_callback((), || {
+        unsafe {
+            WINDOW_CLASS = build_window_class("GPUIWindow", class!(NSWindow));
+            PANEL_CLASS = build_window_class("GPUIPanel", class!(NSPanel));
+            VIEW_CLASS = {
+                let mut decl = ClassDecl::new("GPUIView", class!(NSView)).unwrap();
+                decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+                decl.add_method(sel!(dealloc), dealloc_view as extern "C" fn(&Object, Sel));
 
-            decl.add_method(
-                sel!(performKeyEquivalent:),
-                handle_key_equivalent as extern "C" fn(&Object, Sel, id) -> BOOL,
-            );
-            decl.add_method(
-                sel!(keyDown:),
-                handle_key_down as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(keyUp:),
-                handle_key_up as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(mouseDown:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(mouseUp:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(rightMouseDown:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(rightMouseUp:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(otherMouseDown:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(otherMouseUp:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(mouseMoved:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(resetCursorRects),
-                reset_cursor_rects as extern "C" fn(&Object, Sel),
-            );
-            decl.add_method(
-                sel!(pressureChangeWithEvent:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(mouseExited:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(magnifyWithEvent:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(mouseDragged:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(rightMouseDragged:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(otherMouseDragged:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(scrollWheel:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(swipeWithEvent:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
-            decl.add_method(
-                sel!(flagsChanged:),
-                handle_view_event as extern "C" fn(&Object, Sel, id),
-            );
+                decl.add_method(
+                    sel!(performKeyEquivalent:),
+                    handle_key_equivalent as extern "C" fn(&Object, Sel, id) -> BOOL,
+                );
+                decl.add_method(
+                    sel!(keyDown:),
+                    handle_key_down as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(keyUp:),
+                    handle_key_up as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(mouseDown:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(mouseUp:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(rightMouseDown:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(rightMouseUp:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(otherMouseDown:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(otherMouseUp:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(mouseMoved:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(resetCursorRects),
+                    reset_cursor_rects as extern "C" fn(&Object, Sel),
+                );
+                decl.add_method(
+                    sel!(pressureChangeWithEvent:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(mouseExited:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(magnifyWithEvent:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(mouseDragged:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(rightMouseDragged:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(otherMouseDragged:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(scrollWheel:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(swipeWithEvent:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(flagsChanged:),
+                    handle_view_event as extern "C" fn(&Object, Sel, id),
+                );
 
-            decl.add_method(
-                sel!(makeBackingLayer),
-                make_backing_layer as extern "C" fn(&Object, Sel) -> id,
-            );
+                decl.add_method(
+                    sel!(makeBackingLayer),
+                    make_backing_layer as extern "C" fn(&Object, Sel) -> id,
+                );
 
-            decl.add_protocol(Protocol::get("CALayerDelegate").unwrap());
-            decl.add_method(
-                sel!(viewDidChangeBackingProperties),
-                view_did_change_backing_properties as extern "C" fn(&Object, Sel),
-            );
-            decl.add_method(
-                sel!(setFrameSize:),
-                set_frame_size as extern "C" fn(&Object, Sel, NSSize),
-            );
-            decl.add_method(
-                sel!(displayLayer:),
-                display_layer as extern "C" fn(&Object, Sel, id),
-            );
+                decl.add_protocol(Protocol::get("CALayerDelegate").unwrap());
+                decl.add_method(
+                    sel!(viewDidChangeBackingProperties),
+                    view_did_change_backing_properties as extern "C" fn(&Object, Sel),
+                );
+                decl.add_method(
+                    sel!(setFrameSize:),
+                    set_frame_size as extern "C" fn(&Object, Sel, NSSize),
+                );
+                decl.add_method(
+                    sel!(displayLayer:),
+                    display_layer as extern "C" fn(&Object, Sel, id),
+                );
 
-            decl.add_protocol(Protocol::get("NSTextInputClient").unwrap());
-            decl.add_method(
-                sel!(validAttributesForMarkedText),
-                valid_attributes_for_marked_text as extern "C" fn(&Object, Sel) -> id,
-            );
-            decl.add_method(
-                sel!(hasMarkedText),
-                has_marked_text as extern "C" fn(&Object, Sel) -> BOOL,
-            );
-            decl.add_method(
-                sel!(markedRange),
-                marked_range as extern "C" fn(&Object, Sel) -> NSRange,
-            );
-            decl.add_method(
-                sel!(selectedRange),
-                selected_range as extern "C" fn(&Object, Sel) -> NSRange,
-            );
-            decl.add_method(
-                sel!(firstRectForCharacterRange:actualRange:),
-                first_rect_for_character_range
-                    as extern "C" fn(&Object, Sel, NSRange, id) -> NSRect,
-            );
-            decl.add_method(
-                sel!(insertText:replacementRange:),
-                insert_text as extern "C" fn(&Object, Sel, id, NSRange),
-            );
-            decl.add_method(
-                sel!(setMarkedText:selectedRange:replacementRange:),
-                set_marked_text as extern "C" fn(&Object, Sel, id, NSRange, NSRange),
-            );
-            decl.add_method(sel!(unmarkText), unmark_text as extern "C" fn(&Object, Sel));
-            decl.add_method(
-                sel!(attributedSubstringForProposedRange:actualRange:),
-                attributed_substring_for_proposed_range
-                    as extern "C" fn(&Object, Sel, NSRange, *mut c_void) -> id,
-            );
-            decl.add_method(
-                sel!(viewDidChangeEffectiveAppearance),
-                view_did_change_effective_appearance as extern "C" fn(&Object, Sel),
-            );
+                decl.add_protocol(Protocol::get("NSTextInputClient").unwrap());
+                decl.add_method(
+                    sel!(validAttributesForMarkedText),
+                    valid_attributes_for_marked_text as extern "C" fn(&Object, Sel) -> id,
+                );
+                decl.add_method(
+                    sel!(hasMarkedText),
+                    has_marked_text as extern "C" fn(&Object, Sel) -> BOOL,
+                );
+                decl.add_method(
+                    sel!(markedRange),
+                    marked_range as extern "C" fn(&Object, Sel) -> NSRange,
+                );
+                decl.add_method(
+                    sel!(selectedRange),
+                    selected_range as extern "C" fn(&Object, Sel) -> NSRange,
+                );
+                decl.add_method(
+                    sel!(firstRectForCharacterRange:actualRange:),
+                    first_rect_for_character_range
+                        as extern "C" fn(&Object, Sel, NSRange, id) -> NSRect,
+                );
+                decl.add_method(
+                    sel!(insertText:replacementRange:),
+                    insert_text as extern "C" fn(&Object, Sel, id, NSRange),
+                );
+                decl.add_method(
+                    sel!(setMarkedText:selectedRange:replacementRange:),
+                    set_marked_text as extern "C" fn(&Object, Sel, id, NSRange, NSRange),
+                );
+                decl.add_method(sel!(unmarkText), unmark_text as extern "C" fn(&Object, Sel));
+                decl.add_method(
+                    sel!(attributedSubstringForProposedRange:actualRange:),
+                    attributed_substring_for_proposed_range
+                        as extern "C" fn(&Object, Sel, NSRange, *mut c_void) -> id,
+                );
+                decl.add_method(
+                    sel!(viewDidChangeEffectiveAppearance),
+                    view_did_change_effective_appearance as extern "C" fn(&Object, Sel),
+                );
 
-            // Suppress beep on keystrokes with modifier keys.
-            decl.add_method(
-                sel!(doCommandBySelector:),
-                do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
-            );
+                // Suppress beep on keystrokes with modifier keys.
+                decl.add_method(
+                    sel!(doCommandBySelector:),
+                    do_command_by_selector as extern "C" fn(&Object, Sel, Sel),
+                );
 
-            decl.add_method(
-                sel!(acceptsFirstMouse:),
-                accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
-            );
+                decl.add_method(
+                    sel!(acceptsFirstMouse:),
+                    accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> BOOL,
+                );
 
-            decl.add_method(
-                sel!(_opaqueRectForWindowMoveWhenInTitlebar),
-                opaque_rect_for_window_move_when_in_titlebar
-                    as extern "C" fn(&Object, Sel) -> NSRect,
-            );
+                decl.add_method(
+                    sel!(_opaqueRectForWindowMoveWhenInTitlebar),
+                    opaque_rect_for_window_move_when_in_titlebar
+                        as extern "C" fn(&Object, Sel) -> NSRect,
+                );
 
-            decl.add_method(
-                sel!(characterIndexForPoint:),
-                character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
-            );
-            decl.register()
-        };
-        OVERLAY_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIOverlayView", class!(NSView)).unwrap();
-            decl.add_ivar::<*const c_void>(OVERLAY_INPUT_IVAR);
-            decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
-            decl.add_method(
-                sel!(dealloc),
-                dealloc_overlay_view as extern "C" fn(&Object, Sel),
-            );
-            decl.add_method(
-                sel!(hitTest:),
-                overlay_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
-            );
-            for selector in [
-                sel!(mouseDown:),
-                sel!(mouseUp:),
-                sel!(rightMouseDown:),
-                sel!(rightMouseUp:),
-                sel!(otherMouseDown:),
-                sel!(otherMouseUp:),
-                sel!(mouseMoved:),
-                sel!(mouseExited:),
-                sel!(mouseDragged:),
-                sel!(rightMouseDragged:),
-                sel!(otherMouseDragged:),
-                sel!(scrollWheel:),
-                sel!(magnifyWithEvent:),
-                sel!(swipeWithEvent:),
-                sel!(pressureChangeWithEvent:),
-            ] {
-                decl.add_method(selector, overlay_event as extern "C" fn(&Object, Sel, id));
-            }
-            decl.register()
-        };
-        BACKDROP_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSView)).unwrap();
-            decl.add_ivar::<f64>("blurRadius");
-            // Within-window NSVisualEffectView materials may use a cached view
-            // image, which cannot include a layer-hosted WebKit child. Sample
-            // the compositor's live layer tree directly instead.
-            extern "C" fn backing_layer(_: &Object, _: Sel) -> id {
-                unsafe {
-                    let layer: id = msg_send![class!(CABackdropLayer), layer];
-                    let _: () = msg_send![layer, setAllowsGroupBlending: YES];
-                    let _: () = msg_send![layer, setAllowsGroupOpacity: YES];
-                    let _: () = msg_send![layer, setIgnoresOffscreenGroups: YES];
-                    let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
-                    let _: () = msg_send![layer, setScale: 0.25f64];
-                    layer
+                decl.add_method(
+                    sel!(characterIndexForPoint:),
+                    character_index_for_point as extern "C" fn(&Object, Sel, NSPoint) -> u64,
+                );
+                decl.register()
+            };
+            OVERLAY_VIEW_CLASS = {
+                let mut decl = ClassDecl::new("GPUIOverlayView", class!(NSView)).unwrap();
+                decl.add_ivar::<*const c_void>(OVERLAY_INPUT_IVAR);
+                decl.add_ivar::<*mut c_void>(WINDOW_STATE_IVAR);
+                decl.add_method(
+                    sel!(dealloc),
+                    dealloc_overlay_view as extern "C" fn(&Object, Sel),
+                );
+                decl.add_method(
+                    sel!(hitTest:),
+                    overlay_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                );
+                for selector in [
+                    sel!(mouseDown:),
+                    sel!(mouseUp:),
+                    sel!(rightMouseDown:),
+                    sel!(rightMouseUp:),
+                    sel!(otherMouseDown:),
+                    sel!(otherMouseUp:),
+                    sel!(mouseMoved:),
+                    sel!(mouseExited:),
+                    sel!(mouseDragged:),
+                    sel!(rightMouseDragged:),
+                    sel!(otherMouseDragged:),
+                    sel!(scrollWheel:),
+                    sel!(magnifyWithEvent:),
+                    sel!(swipeWithEvent:),
+                    sel!(pressureChangeWithEvent:),
+                ] {
+                    decl.add_method(selector, overlay_event as extern "C" fn(&Object, Sel, id));
                 }
-            }
-            decl.add_method(
-                sel!(makeBackingLayer),
-                backing_layer as extern "C" fn(&Object, Sel) -> id,
-            );
-            extern "C" fn passthrough(_: &Object, _: Sel, _: NSPoint) -> id {
-                nil
-            }
-            decl.add_method(
-                sel!(hitTest:),
-                passthrough as extern "C" fn(&Object, Sel, NSPoint) -> id,
-            );
-            decl.register()
-        };
-        BLURRED_VIEW_CLASS = {
-            let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
-            decl.add_method(
-                sel!(initWithFrame:),
-                blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
-            );
-            decl.add_method(
-                sel!(updateLayer),
-                blurred_view_update_layer as extern "C" fn(&Object, Sel),
-            );
-            decl.register()
-        };
-    }
+                decl.register()
+            };
+            BACKDROP_VIEW_CLASS = {
+                let mut decl = ClassDecl::new("GPUIBackdropView", class!(NSView)).unwrap();
+                decl.add_ivar::<f64>("blurRadius");
+                // Within-window NSVisualEffectView materials may use a cached view
+                // image, which cannot include a layer-hosted WebKit child. Sample
+                // the compositor's live layer tree directly instead.
+                extern "C" fn backing_layer(_: &Object, _: Sel) -> id {
+                    guarded_callback(nil, || unsafe {
+                        let layer: id = msg_send![class!(CABackdropLayer), layer];
+                        let _: () = msg_send![layer, setAllowsGroupBlending: YES];
+                        let _: () = msg_send![layer, setAllowsGroupOpacity: YES];
+                        let _: () = msg_send![layer, setIgnoresOffscreenGroups: YES];
+                        let _: () = msg_send![layer, setAllowsInPlaceFiltering: NO];
+                        let _: () = msg_send![layer, setScale: 0.25f64];
+                        layer
+                    })
+                }
+                decl.add_method(
+                    sel!(makeBackingLayer),
+                    backing_layer as extern "C" fn(&Object, Sel) -> id,
+                );
+                extern "C" fn passthrough(_: &Object, _: Sel, _: NSPoint) -> id {
+                    guarded_callback(nil, || nil)
+                }
+                decl.add_method(
+                    sel!(hitTest:),
+                    passthrough as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                );
+                decl.register()
+            };
+            BLURRED_VIEW_CLASS = {
+                let mut decl = ClassDecl::new("BlurredView", class!(NSVisualEffectView)).unwrap();
+                decl.add_method(
+                    sel!(initWithFrame:),
+                    blurred_view_init_with_frame as extern "C" fn(&Object, Sel, NSRect) -> id,
+                );
+                decl.add_method(
+                    sel!(updateLayer),
+                    blurred_view_update_layer as extern "C" fn(&Object, Sel),
+                );
+                decl.register()
+            };
+        }
+    })
 }
 
 pub(crate) fn convert_mouse_position(position: NSPoint, window_height: Pixels) -> Point<Pixels> {
@@ -888,8 +893,17 @@ impl MacWindow {
         foreground_executor: ForegroundExecutor,
         background_executor: BackgroundExecutor,
         renderer_context: renderer::Context,
-    ) -> Self {
+    ) -> Result<Self> {
         unsafe {
+            anyhow::ensure!(
+                !WINDOW_CLASS.is_null()
+                    && !PANEL_CLASS.is_null()
+                    && !VIEW_CLASS.is_null()
+                    && !OVERLAY_VIEW_CLASS.is_null()
+                    && !BACKDROP_VIEW_CLASS.is_null()
+                    && !BLURRED_VIEW_CLASS.is_null(),
+                "macOS window classes failed to initialize"
+            );
             let pool = NSAutoreleasePool::new(nil);
 
             let allows_automatic_window_tabbing = tabbing_identifier.is_some();
@@ -1221,7 +1235,7 @@ impl MacWindow {
 
             pool.drain();
 
-            window
+            Ok(window)
         }
     }
 
@@ -1542,10 +1556,10 @@ impl PlatformWindow for MacWindow {
     fn merge_all_windows(&self) {
         let native_window = self.0.lock().native_window;
         extern "C" fn merge_windows_async(context: *mut std::ffi::c_void) {
-            unsafe {
+            guarded_callback((), || unsafe {
                 let native_window = context as id;
                 let _: () = msg_send![native_window, mergeAllWindows:nil];
-            }
+            })
         }
 
         unsafe {
@@ -1557,11 +1571,11 @@ impl PlatformWindow for MacWindow {
     fn move_tab_to_new_window(&self) {
         let native_window = self.0.lock().native_window;
         extern "C" fn move_tab_async(context: *mut std::ffi::c_void) {
-            unsafe {
+            guarded_callback((), || unsafe {
                 let native_window = context as id;
                 let _: () = msg_send![native_window, moveTabToNewWindow:nil];
                 let _: () = msg_send![native_window, makeKeyAndOrderFront: nil];
-            }
+            })
         }
 
         unsafe {
@@ -1731,12 +1745,14 @@ impl PlatformWindow for MacWindow {
             }
 
             let (done_tx, done_rx) = oneshot::channel();
-            let done_tx = Cell::new(Some(done_tx));
+            let done_tx = GuardedDrop::new(Cell::new(Some(done_tx)));
             let block = ConcreteBlock::new(move |answer: NSInteger| {
-                let _: () = msg_send![alert, release];
-                if let Some(done_tx) = done_tx.take() {
-                    let _ = done_tx.send(answer.try_into().unwrap());
-                }
+                guarded_callback((), || {
+                    let _: () = msg_send![alert, release];
+                    if let Some(done_tx) = done_tx.take() {
+                        let _ = done_tx.send(answer.try_into().unwrap());
+                    }
+                })
             });
             let block = block.copy();
             let lock = self.0.lock();
@@ -2366,7 +2382,7 @@ struct A11yActivationHandler {
 
 impl accesskit::ActivationHandler for A11yActivationHandler {
     fn request_initial_tree(&mut self) -> Option<accesskit::TreeUpdate> {
-        (self.callback)()
+        guarded_callback(None, || (self.callback)())
     }
 }
 
@@ -2374,7 +2390,7 @@ struct A11yActionHandler(Box<dyn Fn(accesskit::ActionRequest) + Send + 'static>)
 
 impl accesskit::ActionHandler for A11yActionHandler {
     fn do_action(&mut self, request: accesskit::ActionRequest) {
-        (self.0)(request);
+        guarded_callback((), || (self.0)(request));
     }
 }
 
@@ -2432,100 +2448,106 @@ unsafe fn get_window_state(object: &Object) -> Arc<Mutex<MacWindowState>> {
 }
 
 unsafe fn drop_window_state(object: &Object) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let raw: *mut c_void = *object.get_ivar(WINDOW_STATE_IVAR);
         Arc::from_raw(raw as *mut Mutex<MacWindowState>);
-    }
+    });
 }
 
 extern "C" fn yes(_: &Object, _: Sel) -> BOOL {
-    YES
+    guarded_callback(YES, || YES)
 }
 
 extern "C" fn dealloc_window(this: &Object, _: Sel) {
-    unsafe {
+    guarded_callback((), || unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSWindow)), dealloc];
-    }
+    })
 }
 
 extern "C" fn dealloc_overlay_view(this: &Object, _: Sel) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let active = *this.get_ivar::<*const c_void>(OVERLAY_INPUT_IVAR) as *const AtomicBool;
         drop(Arc::from_raw(active));
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
-    }
+    })
 }
 
 extern "C" fn dealloc_view(this: &Object, _: Sel) {
-    unsafe {
+    guarded_callback((), || unsafe {
         drop_window_state(this);
         let _: () = msg_send![super(this, class!(NSView)), dealloc];
-    }
+    })
 }
 
 extern "C" fn reset_cursor_rects(this: &Object, _: Sel) {
-    // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
-    // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
-    // below is a valid NSCursor.
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
+    guarded_callback((), || {
+        // SAFETY: AppKit invokes cursor-rect updates on the main thread for GPUIView instances,
+        // whose WINDOW_STATE_IVAR is initialized when the view is created. The cursor registered
+        // below is a valid NSCursor.
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSView)), resetCursorRects];
 
-        let window_state = get_window_state(this);
-        let cursor_style = window_state.lock().cursor_style;
+            let window_state = get_window_state(this);
+            let cursor_style = window_state.lock().cursor_style;
 
-        let cursor: id = match cursor_style {
-            CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
-            CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
-            CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
-            CursorStyle::ClosedHand => msg_send![class!(NSCursor), closedHandCursor],
-            CursorStyle::OpenHand => msg_send![class!(NSCursor), openHandCursor],
-            CursorStyle::PointingHand => msg_send![class!(NSCursor), pointingHandCursor],
-            CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
-            CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
-            CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
-            CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
-            CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
-            CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
-            CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
-            CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
+            let cursor: id = match cursor_style {
+                CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
+                CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
+                CursorStyle::Crosshair => msg_send![class!(NSCursor), crosshairCursor],
+                CursorStyle::ClosedHand => msg_send![class!(NSCursor), closedHandCursor],
+                CursorStyle::OpenHand => msg_send![class!(NSCursor), openHandCursor],
+                CursorStyle::PointingHand => msg_send![class!(NSCursor), pointingHandCursor],
+                CursorStyle::ResizeLeftRight => msg_send![class!(NSCursor), resizeLeftRightCursor],
+                CursorStyle::ResizeUpDown => msg_send![class!(NSCursor), resizeUpDownCursor],
+                CursorStyle::ResizeLeft => msg_send![class!(NSCursor), resizeLeftCursor],
+                CursorStyle::ResizeRight => msg_send![class!(NSCursor), resizeRightCursor],
+                CursorStyle::ResizeColumn => msg_send![class!(NSCursor), resizeLeftRightCursor],
+                CursorStyle::ResizeRow => msg_send![class!(NSCursor), resizeUpDownCursor],
+                CursorStyle::ResizeUp => msg_send![class!(NSCursor), resizeUpCursor],
+                CursorStyle::ResizeDown => msg_send![class!(NSCursor), resizeDownCursor],
 
-            // Undocumented, private class methods:
-            // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
-            CursorStyle::ResizeUpLeftDownRight => {
-                msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
-            }
-            CursorStyle::ResizeUpRightDownLeft => {
-                msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
-            }
+                // Undocumented, private class methods:
+                // https://stackoverflow.com/questions/27242353/cocoa-predefined-resize-mouse-cursor
+                CursorStyle::ResizeUpLeftDownRight => {
+                    msg_send![class!(NSCursor), _windowResizeNorthWestSouthEastCursor]
+                }
+                CursorStyle::ResizeUpRightDownLeft => {
+                    msg_send![class!(NSCursor), _windowResizeNorthEastSouthWestCursor]
+                }
 
-            CursorStyle::IBeamCursorForVerticalLayout => {
-                msg_send![class!(NSCursor), IBeamCursorForVerticalLayout]
-            }
-            CursorStyle::OperationNotAllowed => {
-                msg_send![class!(NSCursor), operationNotAllowedCursor]
-            }
-            CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
-            CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
-            CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
-        };
+                CursorStyle::IBeamCursorForVerticalLayout => {
+                    msg_send![class!(NSCursor), IBeamCursorForVerticalLayout]
+                }
+                CursorStyle::OperationNotAllowed => {
+                    msg_send![class!(NSCursor), operationNotAllowedCursor]
+                }
+                CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
+                CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
+                CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            };
 
-        let bounds = NSView::bounds(this as *const Object as id);
-        let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
-    }
+            let bounds = NSView::bounds(this as *const Object as id);
+            let _: () = msg_send![this, addCursorRect: bounds cursor: cursor];
+        }
+    })
 }
 
 extern "C" fn handle_key_equivalent(this: &Object, _: Sel, native_event: id) -> BOOL {
-    handle_key_event(this, native_event, true)
+    guarded_callback(NO, || handle_key_event(this, native_event, true))
 }
 
 extern "C" fn handle_key_down(this: &Object, _: Sel, native_event: id) {
-    handle_key_event(this, native_event, false);
+    guarded_callback((), || {
+        handle_key_event(this, native_event, false);
+    })
 }
 
 extern "C" fn handle_key_up(this: &Object, _: Sel, native_event: id) {
-    handle_key_event(this, native_event, false);
+    guarded_callback((), || {
+        handle_key_event(this, native_event, false);
+    })
 }
 
 // Things to test if you're modifying this method:
@@ -2593,346 +2615,362 @@ unsafe fn is_ime_input_source_active() -> bool {
 }
 
 extern "C" fn handle_key_event(this: &Object, native_event: id, key_equivalent: bool) -> BOOL {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
+    guarded_callback(NO, || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
 
-    let window_height = lock.content_size().height;
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+        let window_height = lock.content_size().height;
+        let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
 
-    let Some(event) = event else {
-        return NO;
-    };
-
-    let run_callback = |event: PlatformInput| -> BOOL {
-        let mut callback = window_state.as_ref().lock().event_callback.take();
-        let handled: BOOL = if let Some(callback) = callback.as_mut() {
-            !callback(event).propagate as BOOL
-        } else {
-            NO
+        let Some(event) = event else {
+            return NO;
         };
-        window_state.as_ref().lock().event_callback = callback;
-        handled
-    };
 
-    match event {
-        PlatformInput::KeyDown(key_down_event) => {
-            // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
-            // If that event isn't handled, it will then dispatch a "key down" event. GPUI
-            // makes no distinction between these two types of events, so we need to ignore
-            // the "key down" event if we've already just processed its "key equivalent" version.
-            if key_equivalent {
-                lock.last_key_equivalent = Some(key_down_event.clone());
-            } else if lock.last_key_equivalent.take().as_ref() == Some(&key_down_event) {
-                return NO;
-            }
+        let run_callback = |event: PlatformInput| -> BOOL {
+            let mut callback = window_state.as_ref().lock().event_callback.take();
+            let handled: BOOL = if let Some(callback) = callback.as_mut() {
+                guarded_callback(NO, || !callback(event).propagate as BOOL)
+            } else {
+                NO
+            };
+            window_state.as_ref().lock().event_callback = callback;
+            handled
+        };
 
-            drop(lock);
+        match event {
+            PlatformInput::KeyDown(key_down_event) => {
+                // For certain keystrokes, macOS will first dispatch a "key equivalent" event.
+                // If that event isn't handled, it will then dispatch a "key down" event. GPUI
+                // makes no distinction between these two types of events, so we need to ignore
+                // the "key down" event if we've already just processed its "key equivalent" version.
+                if key_equivalent {
+                    lock.last_key_equivalent = Some(key_down_event.clone());
+                } else if lock.last_key_equivalent.take().as_ref() == Some(&key_down_event) {
+                    return NO;
+                }
 
-            let is_composing =
-                with_input_handler(this, |input_handler| input_handler.marked_text_range())
-                    .flatten()
-                    .is_some();
+                drop(lock);
 
-            // If we're composing, send the key to the input handler first;
-            // otherwise we only send to the input handler if we don't have a matching binding.
-            // The input handler may call `do_command_by_selector` if it doesn't know how to handle
-            // a key. If it does so, it will return YES so we won't send the key twice.
-            // We also do this for non-printing keys (like arrow keys and escape) as the IME menu
-            // may need them even if there is no marked text;
-            // however we skip keys with control or the input handler adds control-characters to the buffer.
-            // and keys with function, as the input handler swallows them.
-            // and keys with platform (Cmd), so that Cmd+key events (e.g. Cmd+`) are not
-            // consumed by the IME on non-QWERTY / dead-key layouts.
-            // We also send printable keys to the IME first when an IME input source (e.g. Japanese,
-            // Korean, Chinese) is active and the input handler accepts text input. This prevents
-            // multi-stroke keybindings like `jj` from intercepting keys that the IME should compose
-            // (e.g. typing 'ji' should produce 'じ', not 'jい'). If the IME doesn't handle the key,
-            // it calls `doCommandBySelector:` which routes it back to keybinding matching.
-            let is_ime_printable_key = !is_composing
-                && key_down_event
-                    .keystroke
-                    .key_char
-                    .as_ref()
-                    .is_some_and(|key_char| key_char.chars().all(|c| !c.is_control()))
-                && !key_down_event.keystroke.modifiers.control
-                && !key_down_event.keystroke.modifiers.function
-                && !key_down_event.keystroke.modifiers.platform
-                && unsafe { is_ime_input_source_active() }
-                && with_input_handler(this, |input_handler| {
-                    input_handler.query_prefers_ime_for_printable_keys()
-                })
-                .unwrap_or(false);
+                let is_composing =
+                    with_input_handler(this, |input_handler| input_handler.marked_text_range())
+                        .flatten()
+                        .is_some();
 
-            if is_composing
-                || is_ime_printable_key
-                || (key_down_event.keystroke.key_char.is_none()
+                // If we're composing, send the key to the input handler first;
+                // otherwise we only send to the input handler if we don't have a matching binding.
+                // The input handler may call `do_command_by_selector` if it doesn't know how to handle
+                // a key. If it does so, it will return YES so we won't send the key twice.
+                // We also do this for non-printing keys (like arrow keys and escape) as the IME menu
+                // may need them even if there is no marked text;
+                // however we skip keys with control or the input handler adds control-characters to the buffer.
+                // and keys with function, as the input handler swallows them.
+                // and keys with platform (Cmd), so that Cmd+key events (e.g. Cmd+`) are not
+                // consumed by the IME on non-QWERTY / dead-key layouts.
+                // We also send printable keys to the IME first when an IME input source (e.g. Japanese,
+                // Korean, Chinese) is active and the input handler accepts text input. This prevents
+                // multi-stroke keybindings like `jj` from intercepting keys that the IME should compose
+                // (e.g. typing 'ji' should produce 'じ', not 'jい'). If the IME doesn't handle the key,
+                // it calls `doCommandBySelector:` which routes it back to keybinding matching.
+                let is_ime_printable_key = !is_composing
+                    && key_down_event
+                        .keystroke
+                        .key_char
+                        .as_ref()
+                        .is_some_and(|key_char| key_char.chars().all(|c| !c.is_control()))
                     && !key_down_event.keystroke.modifiers.control
                     && !key_down_event.keystroke.modifiers.function
-                    && !key_down_event.keystroke.modifiers.platform)
-            {
+                    && !key_down_event.keystroke.modifiers.platform
+                    && unsafe { is_ime_input_source_active() }
+                    && with_input_handler(this, |input_handler| {
+                        input_handler.query_prefers_ime_for_printable_keys()
+                    })
+                    .unwrap_or(false);
+
+                if is_composing
+                    || is_ime_printable_key
+                    || (key_down_event.keystroke.key_char.is_none()
+                        && !key_down_event.keystroke.modifiers.control
+                        && !key_down_event.keystroke.modifiers.function
+                        && !key_down_event.keystroke.modifiers.platform)
                 {
-                    let mut lock = window_state.as_ref().lock();
-                    lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
-                    lock.do_command_handled.take();
-                    drop(lock);
-                }
+                    {
+                        let mut lock = window_state.as_ref().lock();
+                        lock.keystroke_for_do_command = Some(key_down_event.keystroke.clone());
+                        lock.do_command_handled.take();
+                        drop(lock);
+                    }
 
-                let handled: BOOL = unsafe {
-                    let input_context: id = msg_send![this, inputContext];
-                    msg_send![input_context, handleEvent: native_event]
-                };
-                window_state.as_ref().lock().keystroke_for_do_command.take();
-                if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
-                    return handled as BOOL;
-                } else if handled == YES {
-                    return YES;
-                }
-
-                let handled = run_callback(PlatformInput::KeyDown(key_down_event));
-                return handled;
-            }
-
-            let handled = run_callback(PlatformInput::KeyDown(key_down_event.clone()));
-            if handled == YES {
-                return YES;
-            }
-
-            if key_down_event.is_held
-                && let Some(key_char) = key_down_event.keystroke.key_char.as_ref()
-            {
-                let handled = with_input_handler(this, |input_handler| {
-                    if !input_handler.apple_press_and_hold_enabled() {
-                        input_handler.replace_text_in_range(None, key_char);
+                    let handled: BOOL = unsafe {
+                        let input_context: id = msg_send![this, inputContext];
+                        msg_send![input_context, handleEvent: native_event]
+                    };
+                    window_state.as_ref().lock().keystroke_for_do_command.take();
+                    if let Some(handled) = window_state.as_ref().lock().do_command_handled.take() {
+                        return handled as BOOL;
+                    } else if handled == YES {
                         return YES;
                     }
-                    NO
-                });
-                if handled == Some(YES) {
+
+                    let handled = run_callback(PlatformInput::KeyDown(key_down_event));
+                    return handled;
+                }
+
+                let handled = run_callback(PlatformInput::KeyDown(key_down_event.clone()));
+                if handled == YES {
                     return YES;
                 }
-            }
 
-            // Don't send key equivalents to the input handler if there are key modifiers other
-            // than Function key, or macOS shortcuts like cmd-` will stop working.
-            if key_equivalent && key_down_event.keystroke.modifiers != Modifiers::function() {
-                return NO;
-            }
+                if key_down_event.is_held
+                    && let Some(key_char) = key_down_event.keystroke.key_char.as_ref()
+                {
+                    let handled = with_input_handler(this, |input_handler| {
+                        if !input_handler.apple_press_and_hold_enabled() {
+                            input_handler.replace_text_in_range(None, key_char);
+                            return YES;
+                        }
+                        NO
+                    });
+                    if handled == Some(YES) {
+                        return YES;
+                    }
+                }
 
-            unsafe {
-                let input_context: id = msg_send![this, inputContext];
-                msg_send![input_context, handleEvent: native_event]
-            }
-        }
+                // Don't send key equivalents to the input handler if there are key modifiers other
+                // than Function key, or macOS shortcuts like cmd-` will stop working.
+                if key_equivalent && key_down_event.keystroke.modifiers != Modifiers::function() {
+                    return NO;
+                }
 
-        PlatformInput::KeyUp(_) => {
-            drop(lock);
-            run_callback(event)
-        }
-
-        _ => NO,
-    }
-}
-
-extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let weak_window_state = Arc::downgrade(&window_state);
-    let mut lock = window_state.as_ref().lock();
-    let window_height = lock.content_size().height;
-    let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
-
-    if let Some(mut event) = event {
-        // AppKit unhides the cursor on the next mouse movement; mirror that here.
-        if matches!(
-            event,
-            PlatformInput::MouseMove(_)
-                | PlatformInput::MouseDown(_)
-                | PlatformInput::MouseUp(_)
-                | PlatformInput::MousePressure(_)
-                | PlatformInput::MouseExited(_)
-                | PlatformInput::ScrollWheel(_)
-                | PlatformInput::Pinch(_)
-        ) {
-            lock.cursor_visible.store(true, Ordering::Relaxed);
-        }
-
-        match &mut event {
-            PlatformInput::MouseDown(
-                event @ MouseDownEvent {
-                    button: MouseButton::Left,
-                    modifiers: Modifiers { control: true, .. },
-                    ..
-                },
-            ) => {
-                // On mac, a ctrl-left click should be handled as a right click.
-                *event = MouseDownEvent {
-                    button: MouseButton::Right,
-                    modifiers: Modifiers {
-                        control: false,
-                        ..event.modifiers
-                    },
-                    click_count: 1,
-                    ..*event
-                };
-            }
-
-            // Handles focusing click.
-            PlatformInput::MouseDown(
-                event @ MouseDownEvent {
-                    button: MouseButton::Left,
-                    ..
-                },
-            ) if (lock.first_mouse) => {
-                *event = MouseDownEvent {
-                    first_mouse: true,
-                    ..*event
-                };
-                lock.first_mouse = false;
-            }
-
-            // Because we map a ctrl-left_down to a right_down -> right_up let's ignore
-            // the ctrl-left_up to avoid having a mismatch in button down/up events if the
-            // user is still holding ctrl when releasing the left mouse button
-            PlatformInput::MouseUp(
-                event @ MouseUpEvent {
-                    button: MouseButton::Left,
-                    modifiers: Modifiers { control: true, .. },
-                    ..
-                },
-            ) => {
-                *event = MouseUpEvent {
-                    button: MouseButton::Right,
-                    modifiers: Modifiers {
-                        control: false,
-                        ..event.modifiers
-                    },
-                    click_count: 1,
-                    ..*event
-                };
-            }
-
-            _ => {}
-        };
-
-        match &event {
-            PlatformInput::MouseDown(_) => {
-                drop(lock);
                 unsafe {
                     let input_context: id = msg_send![this, inputContext];
                     msg_send![input_context, handleEvent: native_event]
                 }
-                lock = window_state.as_ref().lock();
             }
-            PlatformInput::MouseMove(
-                event @ MouseMoveEvent {
-                    pressed_button: Some(_),
-                    ..
-                },
-            ) => {
-                // Synthetic drag is used for selecting long buffer contents while buffer is being scrolled.
-                // External file drag and drop is able to emit its own synthetic mouse events which will conflict
-                // with these ones.
-                if !lock.external_files_dragged {
+
+            PlatformInput::KeyUp(_) => {
+                drop(lock);
+                run_callback(event)
+            }
+
+            _ => NO,
+        }
+    })
+}
+
+extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let weak_window_state = Arc::downgrade(&window_state);
+        let mut lock = window_state.as_ref().lock();
+        let window_height = lock.content_size().height;
+        let event = unsafe { platform_input_from_native(native_event, Some(window_height)) };
+
+        if let Some(mut event) = event {
+            // AppKit unhides the cursor on the next mouse movement; mirror that here.
+            if matches!(
+                event,
+                PlatformInput::MouseMove(_)
+                    | PlatformInput::MouseDown(_)
+                    | PlatformInput::MouseUp(_)
+                    | PlatformInput::MousePressure(_)
+                    | PlatformInput::MouseExited(_)
+                    | PlatformInput::ScrollWheel(_)
+                    | PlatformInput::Pinch(_)
+            ) {
+                lock.cursor_visible.store(true, Ordering::Relaxed);
+            }
+
+            match &mut event {
+                PlatformInput::MouseDown(
+                    event @ MouseDownEvent {
+                        button: MouseButton::Left,
+                        modifiers: Modifiers { control: true, .. },
+                        ..
+                    },
+                ) => {
+                    // On mac, a ctrl-left click should be handled as a right click.
+                    *event = MouseDownEvent {
+                        button: MouseButton::Right,
+                        modifiers: Modifiers {
+                            control: false,
+                            ..event.modifiers
+                        },
+                        click_count: 1,
+                        ..*event
+                    };
+                }
+
+                // Handles focusing click.
+                PlatformInput::MouseDown(
+                    event @ MouseDownEvent {
+                        button: MouseButton::Left,
+                        ..
+                    },
+                ) if (lock.first_mouse) => {
+                    *event = MouseDownEvent {
+                        first_mouse: true,
+                        ..*event
+                    };
+                    lock.first_mouse = false;
+                }
+
+                // Because we map a ctrl-left_down to a right_down -> right_up let's ignore
+                // the ctrl-left_up to avoid having a mismatch in button down/up events if the
+                // user is still holding ctrl when releasing the left mouse button
+                PlatformInput::MouseUp(
+                    event @ MouseUpEvent {
+                        button: MouseButton::Left,
+                        modifiers: Modifiers { control: true, .. },
+                        ..
+                    },
+                ) => {
+                    *event = MouseUpEvent {
+                        button: MouseButton::Right,
+                        modifiers: Modifiers {
+                            control: false,
+                            ..event.modifiers
+                        },
+                        click_count: 1,
+                        ..*event
+                    };
+                }
+
+                _ => {}
+            };
+
+            match &event {
+                PlatformInput::MouseDown(_) => {
+                    drop(lock);
+                    unsafe {
+                        let input_context: id = msg_send![this, inputContext];
+                        msg_send![input_context, handleEvent: native_event]
+                    }
+                    lock = window_state.as_ref().lock();
+                }
+                PlatformInput::MouseMove(
+                    event @ MouseMoveEvent {
+                        pressed_button: Some(_),
+                        ..
+                    },
+                ) => {
+                    // Synthetic drag is used for selecting long buffer contents while buffer is being scrolled.
+                    // External file drag and drop is able to emit its own synthetic mouse events which will conflict
+                    // with these ones.
+                    if !lock.external_files_dragged {
+                        lock.synthetic_drag_counter += 1;
+                        let executor = lock.foreground_executor.clone();
+                        executor
+                            .spawn(synthetic_drag(
+                                weak_window_state,
+                                lock.synthetic_drag_counter,
+                                event.clone(),
+                                lock.background_executor.clone(),
+                            ))
+                            .detach();
+                    }
+                }
+
+                PlatformInput::MouseUp(MouseUpEvent { .. }) => {
                     lock.synthetic_drag_counter += 1;
-                    let executor = lock.foreground_executor.clone();
-                    executor
-                        .spawn(synthetic_drag(
-                            weak_window_state,
-                            lock.synthetic_drag_counter,
-                            event.clone(),
-                            lock.background_executor.clone(),
-                        ))
-                        .detach();
-                }
-            }
-
-            PlatformInput::MouseUp(MouseUpEvent { .. }) => {
-                lock.synthetic_drag_counter += 1;
-            }
-
-            PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                modifiers,
-                capslock,
-            }) => {
-                // Only raise modifiers changed event when they have actually changed
-                if let Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
-                    modifiers: prev_modifiers,
-                    capslock: prev_capslock,
-                })) = &lock.previous_modifiers_changed_event
-                    && prev_modifiers == modifiers
-                    && prev_capslock == capslock
-                {
-                    return;
                 }
 
-                lock.previous_modifiers_changed_event = Some(event.clone());
+                PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                    modifiers,
+                    capslock,
+                }) => {
+                    // Only raise modifiers changed event when they have actually changed
+                    if let Some(PlatformInput::ModifiersChanged(ModifiersChangedEvent {
+                        modifiers: prev_modifiers,
+                        capslock: prev_capslock,
+                    })) = &lock.previous_modifiers_changed_event
+                        && prev_modifiers == modifiers
+                        && prev_capslock == capslock
+                    {
+                        return;
+                    }
+
+                    lock.previous_modifiers_changed_event = Some(event.clone());
+                }
+
+                _ => {}
             }
 
-            _ => {}
+            if let Some(mut callback) = lock.event_callback.take() {
+                drop(lock);
+                guarded_callback((), || {
+                    callback(event);
+                });
+                window_state.lock().event_callback = Some(callback);
+            }
         }
-
-        if let Some(mut callback) = lock.event_callback.take() {
-            drop(lock);
-            callback(event);
-            window_state.lock().event_callback = Some(callback);
-        }
-    }
+    })
 }
 
 extern "C" fn window_did_change_occlusion_state(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let lock = &mut *window_state.lock();
-    unsafe {
-        if lock
-            .native_window
-            .occlusionState()
-            .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
-        {
-            lock.move_traffic_light();
-            lock.start_display_link();
-        } else {
-            lock.stop_display_link();
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let lock = &mut *window_state.lock();
+        unsafe {
+            if lock
+                .native_window
+                .occlusionState()
+                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            {
+                lock.move_traffic_light();
+                lock.start_display_link();
+            } else {
+                lock.stop_display_link();
+            }
         }
-    }
+    })
 }
 
 extern "C" fn window_did_resize(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        window_state.as_ref().lock().move_traffic_light();
+    })
 }
 
 extern "C" fn window_will_enter_fullscreen(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    lock.fullscreen_restore_bounds = lock.bounds();
-    lock.restore_traffic_light();
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        lock.fullscreen_restore_bounds = lock.bounds();
+        lock.restore_traffic_light();
 
-    let min_version = NSOperatingSystemVersion::new(15, 3, 0);
+        let min_version = NSOperatingSystemVersion::new(15, 3, 0);
 
-    if is_macos_version_at_least(min_version) {
-        unsafe {
-            lock.native_window.setTitlebarAppearsTransparent_(NO);
+        if is_macos_version_at_least(min_version) {
+            unsafe {
+                lock.native_window.setTitlebarAppearsTransparent_(NO);
+            }
         }
-    }
+    })
 }
 
 extern "C" fn window_will_exit_fullscreen(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.as_ref().lock();
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let lock = window_state.as_ref().lock();
 
-    let min_version = NSOperatingSystemVersion::new(15, 3, 0);
+        let min_version = NSOperatingSystemVersion::new(15, 3, 0);
 
-    if is_macos_version_at_least(min_version) && lock.transparent_titlebar {
-        unsafe {
-            lock.native_window.setTitlebarAppearsTransparent_(YES);
+        if is_macos_version_at_least(min_version) && lock.transparent_titlebar {
+            unsafe {
+                lock.native_window.setTitlebarAppearsTransparent_(YES);
+            }
         }
-    }
+    })
 }
 
 extern "C" fn window_did_exit_fullscreen(this: &Object, _: Sel, _: id) {
-    // SAFETY: This method is registered only on GPUI window classes, which initialize
-    // WINDOW_STATE_IVAR with an Arc<Mutex<MacWindowState>> during window creation.
-    let window_state = unsafe { get_window_state(this) };
-    window_state.as_ref().lock().move_traffic_light();
+    guarded_callback((), || {
+        // SAFETY: This method is registered only on GPUI window classes, which initialize
+        // WINDOW_STATE_IVAR with an Arc<Mutex<MacWindowState>> during window creation.
+        let window_state = unsafe { get_window_state(this) };
+        window_state.as_ref().lock().move_traffic_light();
+    })
 }
 
 pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bool {
@@ -2940,13 +2978,15 @@ pub(crate) fn is_macos_version_at_least(version: NSOperatingSystemVersion) -> bo
 }
 
 extern "C" fn window_did_move(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    if let Some(mut callback) = lock.moved_callback.take() {
-        drop(lock);
-        callback();
-        window_state.lock().moved_callback = Some(callback);
-    }
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.moved_callback.take() {
+            drop(lock);
+            guarded_callback((), || callback());
+            window_state.lock().moved_callback = Some(callback);
+        }
+    })
 }
 
 // Update the window scale factor and drawable size, and call the resize callback if any.
@@ -2970,116 +3010,122 @@ fn update_window_scale_factor(window_state: &Arc<Mutex<MacWindowState>>) {
         let content_size = lock.content_size();
         let scale_factor = lock.scale_factor();
         drop(lock);
-        callback(content_size, scale_factor);
+        guarded_callback((), || callback(content_size, scale_factor));
         window_state.as_ref().lock().resize_callback = Some(callback);
     };
 }
 
 extern "C" fn window_did_change_screen(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    lock.start_display_link();
-    drop(lock);
-    update_window_scale_factor(&window_state);
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        lock.start_display_link();
+        drop(lock);
+        update_window_scale_factor(&window_state);
+    })
 }
 
 extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let lock = window_state.lock();
-    let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
-
-    // AppKit also unhides the cursor on activation changes, so mirror that here.
-    lock.cursor_visible.store(true, Ordering::Relaxed);
-
-    // When opening a pop-up while the application isn't active, Cocoa sends a spurious
-    // `windowDidBecomeKey` message to the previous key window even though that window
-    // isn't actually key. This causes a bug if the application is later activated while
-    // the pop-up is still open, making it impossible to activate the previous key window
-    // even if the pop-up gets closed. The only way to activate it again is to de-activate
-    // the app and re-activate it, which is a pretty bad UX.
-    // The following code detects the spurious event and invokes `resignKeyWindow`:
-    // in theory, we're not supposed to invoke this method manually but it balances out
-    // the spurious `becomeKeyWindow` event and helps us work around that bug.
-    if selector == sel!(windowDidBecomeKey:) && !is_active {
-        let native_window = lock.native_window;
-        drop(lock);
-        unsafe {
-            let _: () = msg_send![native_window, resignKeyWindow];
-        }
-        return;
-    }
-
-    let executor = lock.foreground_executor.clone();
-    drop(lock);
-
-    let a11y_events = {
-        let mut lock = window_state.lock();
-        lock.accesskit_adapter
-            .as_mut()
-            .and_then(|adapter| adapter.update_view_focus_state(is_active))
-    };
-    if let Some(events) = a11y_events {
-        events.raise();
-    }
-
-    // When a window becomes active, trigger an immediate synchronous frame request to prevent
-    // tab flicker when switching between windows in native tabs mode.
-    //
-    // This is only done on subsequent activations (not the first) to ensure the initial focus
-    // path is properly established. Without this guard, the focus state would remain unset until
-    // the first mouse click, causing keybindings to be non-functional.
-    if selector == sel!(windowDidBecomeKey:) && is_active {
+    guarded_callback((), || {
         let window_state = unsafe { get_window_state(this) };
-        let mut lock = window_state.lock();
+        let lock = window_state.lock();
+        let is_active = unsafe { lock.native_window.isKeyWindow() == YES };
 
-        if lock.activated_least_once && !lock.show_in_progress {
-            if let Some(mut callback) = lock.request_frame_callback.take() {
-                lock.set_presents_with_transaction(true);
-                lock.stop_display_link();
-                drop(lock);
-                callback(Default::default());
+        // AppKit also unhides the cursor on activation changes, so mirror that here.
+        lock.cursor_visible.store(true, Ordering::Relaxed);
 
-                let mut lock = window_state.lock();
-                lock.request_frame_callback = Some(callback);
-                lock.set_presents_with_transaction(false);
-                lock.start_display_link();
+        // When opening a pop-up while the application isn't active, Cocoa sends a spurious
+        // `windowDidBecomeKey` message to the previous key window even though that window
+        // isn't actually key. This causes a bug if the application is later activated while
+        // the pop-up is still open, making it impossible to activate the previous key window
+        // even if the pop-up gets closed. The only way to activate it again is to de-activate
+        // the app and re-activate it, which is a pretty bad UX.
+        // The following code detects the spurious event and invokes `resignKeyWindow`:
+        // in theory, we're not supposed to invoke this method manually but it balances out
+        // the spurious `becomeKeyWindow` event and helps us work around that bug.
+        if selector == sel!(windowDidBecomeKey:) && !is_active {
+            let native_window = lock.native_window;
+            drop(lock);
+            unsafe {
+                let _: () = msg_send![native_window, resignKeyWindow];
             }
-        } else {
-            lock.activated_least_once = true;
+            return;
         }
-    }
 
-    executor
-        .spawn(async move {
-            let mut lock = window_state.as_ref().lock();
-            if is_active {
-                lock.move_traffic_light();
+        let executor = lock.foreground_executor.clone();
+        drop(lock);
+
+        let a11y_events = {
+            let mut lock = window_state.lock();
+            lock.accesskit_adapter
+                .as_mut()
+                .and_then(|adapter| adapter.update_view_focus_state(is_active))
+        };
+        if let Some(events) = a11y_events {
+            events.raise();
+        }
+
+        // When a window becomes active, trigger an immediate synchronous frame request to prevent
+        // tab flicker when switching between windows in native tabs mode.
+        //
+        // This is only done on subsequent activations (not the first) to ensure the initial focus
+        // path is properly established. Without this guard, the focus state would remain unset until
+        // the first mouse click, causing keybindings to be non-functional.
+        if selector == sel!(windowDidBecomeKey:) && is_active {
+            let window_state = unsafe { get_window_state(this) };
+            let mut lock = window_state.lock();
+
+            if lock.activated_least_once && !lock.show_in_progress {
+                if let Some(mut callback) = lock.request_frame_callback.take() {
+                    lock.set_presents_with_transaction(true);
+                    lock.stop_display_link();
+                    drop(lock);
+                    guarded_callback((), || callback(Default::default()));
+
+                    let mut lock = window_state.lock();
+                    lock.request_frame_callback = Some(callback);
+                    lock.set_presents_with_transaction(false);
+                    lock.start_display_link();
+                }
+            } else {
+                lock.activated_least_once = true;
             }
+        }
 
-            if let Some(mut callback) = lock.activate_callback.take() {
-                drop(lock);
-                callback(is_active);
-                window_state.lock().activate_callback = Some(callback);
-            };
-        })
-        .detach();
+        executor
+            .spawn(async move {
+                let mut lock = window_state.as_ref().lock();
+                if is_active {
+                    lock.move_traffic_light();
+                }
+
+                if let Some(mut callback) = lock.activate_callback.take() {
+                    drop(lock);
+                    guarded_callback((), || callback(is_active));
+                    window_state.lock().activate_callback = Some(callback);
+                };
+            })
+            .detach();
+    })
 }
 
 extern "C" fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    if let Some(mut callback) = lock.should_close_callback.take() {
-        drop(lock);
-        let should_close = callback();
-        window_state.lock().should_close_callback = Some(callback);
-        should_close as BOOL
-    } else {
-        YES
-    }
+    guarded_callback(NO, || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.should_close_callback.take() {
+            drop(lock);
+            let should_close = guarded_callback(false, || callback());
+            window_state.lock().should_close_callback = Some(callback);
+            should_close as BOOL
+        } else {
+            YES
+        }
+    })
 }
 
 extern "C" fn close_window(this: &Object, _: Sel) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let close_callback = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
@@ -3088,127 +3134,143 @@ extern "C" fn close_window(this: &Object, _: Sel) {
         };
 
         if let Some(callback) = close_callback {
-            callback();
+            guarded_callback((), || callback());
         }
 
         let _: () = msg_send![super(this, class!(NSWindow)), close];
-    }
+    })
 }
 
 extern "C" fn make_backing_layer(this: &Object, _: Sel) -> id {
-    let window_state = unsafe { get_window_state(this) };
-    let window_state = window_state.as_ref().lock();
-    window_state.renderer.layer_ptr() as id
+    guarded_callback(nil, || {
+        let window_state = unsafe { get_window_state(this) };
+        let window_state = window_state.as_ref().lock();
+        window_state.renderer.layer_ptr() as id
+    })
 }
 
 extern "C" fn view_did_change_backing_properties(this: &Object, _: Sel) {
-    let window_state = unsafe { get_window_state(this) };
-    update_window_scale_factor(&window_state);
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        update_window_scale_factor(&window_state);
+    })
 }
 
 extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
-    fn convert(value: NSSize) -> Size<Pixels> {
-        Size {
-            width: px(value.width as f32),
-            height: px(value.height as f32),
+    guarded_callback((), || {
+        fn convert(value: NSSize) -> Size<Pixels> {
+            Size {
+                width: px(value.width as f32),
+                height: px(value.height as f32),
+            }
         }
-    }
 
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
 
-    let new_size = convert(size);
-    let old_size = unsafe {
-        let old_frame: NSRect = msg_send![this, frame];
-        convert(old_frame.size)
-    };
+        let new_size = convert(size);
+        let old_size = unsafe {
+            let old_frame: NSRect = msg_send![this, frame];
+            convert(old_frame.size)
+        };
 
-    if old_size == new_size {
-        return;
-    }
+        if old_size == new_size {
+            return;
+        }
 
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
-    }
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
+        }
 
-    let scale_factor = lock.scale_factor();
-    let drawable_size = new_size.to_device_pixels(scale_factor);
-    lock.renderer.update_drawable_size(drawable_size);
-
-    if let Some(mut callback) = lock.resize_callback.take() {
-        let content_size = lock.content_size();
         let scale_factor = lock.scale_factor();
-        drop(lock);
-        callback(content_size, scale_factor);
-        window_state.lock().resize_callback = Some(callback);
-    };
+        let drawable_size = new_size.to_device_pixels(scale_factor);
+        lock.renderer.update_drawable_size(drawable_size);
+
+        if let Some(mut callback) = lock.resize_callback.take() {
+            let content_size = lock.content_size();
+            let scale_factor = lock.scale_factor();
+            drop(lock);
+            guarded_callback((), || callback(content_size, scale_factor));
+            window_state.lock().resize_callback = Some(callback);
+        };
+    })
 }
 
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.lock();
-    if !lock.visible || lock.show_in_progress || lock.closed.load(Ordering::Acquire) {
-        return;
-    }
-    if let Some(mut callback) = lock.request_frame_callback.take() {
-        lock.set_presents_with_transaction(true);
-        lock.stop_display_link();
-        drop(lock);
-        callback(Default::default());
-
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
-        lock.request_frame_callback = Some(callback);
-        lock.set_presents_with_transaction(false);
-        lock.start_display_link();
-    }
+        if !lock.visible || lock.show_in_progress || lock.closed.load(Ordering::Acquire) {
+            return;
+        }
+        if let Some(mut callback) = lock.request_frame_callback.take() {
+            lock.set_presents_with_transaction(true);
+            lock.stop_display_link();
+            drop(lock);
+            guarded_callback((), || callback(Default::default()));
+
+            let mut lock = window_state.lock();
+            lock.request_frame_callback = Some(callback);
+            lock.set_presents_with_transaction(false);
+            lock.start_display_link();
+        }
+    })
 }
 
 extern "C" fn step(view: *mut c_void) {
-    let view = view as id;
-    let window_state = unsafe { get_window_state(&*view) };
-    let mut lock = window_state.lock();
-    // A queued display-link delivery may arrive after orderOut stopped its
-    // subscription. Never revive rendering for a hidden or closed window.
-    if !lock.visible
-        || lock.show_in_progress
-        || lock.closed.load(Ordering::Acquire)
-        || !lock.frame_requested.load(Ordering::Acquire)
-    {
-        return;
-    }
+    guarded_callback((), || {
+        let view = view as id;
+        let window_state = unsafe { get_window_state(&*view) };
+        let mut lock = window_state.lock();
+        // A queued display-link delivery may arrive after orderOut stopped its
+        // subscription. Never revive rendering for a hidden or closed window.
+        if !lock.visible
+            || lock.show_in_progress
+            || lock.closed.load(Ordering::Acquire)
+            || !lock.frame_requested.load(Ordering::Acquire)
+        {
+            return;
+        }
 
-    if let Some(mut callback) = lock.request_frame_callback.take() {
-        drop(lock);
-        callback(Default::default());
-        window_state.lock().request_frame_callback = Some(callback);
-    }
+        if let Some(mut callback) = lock.request_frame_callback.take() {
+            drop(lock);
+            guarded_callback((), || callback(Default::default()));
+            window_state.lock().request_frame_callback = Some(callback);
+        }
+    })
 }
 
 extern "C" fn valid_attributes_for_marked_text(_: &Object, _: Sel) -> id {
-    unsafe { msg_send![class!(NSArray), array] }
+    guarded_callback(nil, || unsafe { msg_send![class!(NSArray), array] })
 }
 
 extern "C" fn has_marked_text(this: &Object, _: Sel) -> BOOL {
-    let has_marked_text_result =
-        with_input_handler(this, |input_handler| input_handler.marked_text_range()).flatten();
+    guarded_callback(NO, || {
+        let has_marked_text_result =
+            with_input_handler(this, |input_handler| input_handler.marked_text_range()).flatten();
 
-    has_marked_text_result.is_some() as BOOL
+        has_marked_text_result.is_some() as BOOL
+    })
 }
 
 extern "C" fn marked_range(this: &Object, _: Sel) -> NSRange {
-    let marked_range_result =
-        with_input_handler(this, |input_handler| input_handler.marked_text_range()).flatten();
+    guarded_callback(NSRange::invalid(), || {
+        let marked_range_result =
+            with_input_handler(this, |input_handler| input_handler.marked_text_range()).flatten();
 
-    marked_range_result.map_or(NSRange::invalid(), |range| range.into())
+        marked_range_result.map_or(NSRange::invalid(), |range| range.into())
+    })
 }
 
 extern "C" fn selected_range(this: &Object, _: Sel) -> NSRange {
-    let selected_range_result = with_input_handler(this, |input_handler| {
-        input_handler.selected_text_range(false)
-    })
-    .flatten();
+    guarded_callback(NSRange::invalid(), || {
+        let selected_range_result = with_input_handler(this, |input_handler| {
+            input_handler.selected_text_range(false)
+        })
+        .flatten();
 
-    selected_range_result.map_or(NSRange::invalid(), |selection| selection.range.into())
+        selected_range_result.map_or(NSRange::invalid(), |selection| selection.range.into())
+    })
 }
 
 extern "C" fn first_rect_for_character_range(
@@ -3217,25 +3279,30 @@ extern "C" fn first_rect_for_character_range(
     range: NSRange,
     _: id,
 ) -> NSRect {
-    let frame = get_frame(this);
-    with_input_handler(this, |input_handler| {
-        input_handler.bounds_for_range(range.to_range()?)
-    })
-    .flatten()
-    .map_or(
+    guarded_callback(
         NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
-        |bounds| {
-            NSRect::new(
-                NSPoint::new(
-                    frame.origin.x + bounds.origin.x.as_f32() as f64,
-                    frame.origin.y + frame.size.height
-                        - bounds.origin.y.as_f32() as f64
-                        - bounds.size.height.as_f32() as f64,
-                ),
-                NSSize::new(
-                    bounds.size.width.as_f32() as f64,
-                    bounds.size.height.as_f32() as f64,
-                ),
+        || {
+            let frame = get_frame(this);
+            with_input_handler(this, |input_handler| {
+                input_handler.bounds_for_range(range.to_range()?)
+            })
+            .flatten()
+            .map_or(
+                NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+                |bounds| {
+                    NSRect::new(
+                        NSPoint::new(
+                            frame.origin.x + bounds.origin.x.as_f32() as f64,
+                            frame.origin.y + frame.size.height
+                                - bounds.origin.y.as_f32() as f64
+                                - bounds.size.height.as_f32() as f64,
+                        ),
+                        NSSize::new(
+                            bounds.size.width.as_f32() as f64,
+                            bounds.size.height.as_f32() as f64,
+                        ),
+                    )
+                },
             )
         },
     )
@@ -3256,7 +3323,7 @@ fn get_frame(this: &Object) -> NSRect {
 }
 
 extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NSRange) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
         let text: id = if is_attributed_string == YES {
@@ -3270,7 +3337,7 @@ extern "C" fn insert_text(this: &Object, _: Sel, text: id, replacement_range: NS
         with_input_handler(this, |input_handler| {
             input_handler.replace_text_in_range(replacement_range, text)
         });
-    }
+    })
 }
 
 extern "C" fn set_marked_text(
@@ -3280,7 +3347,7 @@ extern "C" fn set_marked_text(
     selected_range: NSRange,
     replacement_range: NSRange,
 ) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let is_attributed_string: BOOL =
             msg_send![text, isKindOfClass: [class!(NSAttributedString)]];
         let text: id = if is_attributed_string == YES {
@@ -3294,10 +3361,12 @@ extern "C" fn set_marked_text(
         with_input_handler(this, |input_handler| {
             input_handler.replace_and_mark_text_in_range(replacement_range, text, selected_range)
         });
-    }
+    })
 }
 extern "C" fn unmark_text(this: &Object, _: Sel) {
-    with_input_handler(this, |input_handler| input_handler.unmark_text());
+    guarded_callback((), || {
+        with_input_handler(this, |input_handler| input_handler.unmark_text());
+    })
 }
 
 extern "C" fn attributed_substring_for_proposed_range(
@@ -3306,75 +3375,86 @@ extern "C" fn attributed_substring_for_proposed_range(
     range: NSRange,
     actual_range: *mut c_void,
 ) -> id {
-    with_input_handler(this, |input_handler| {
-        let range = range.to_range()?;
-        if range.is_empty() {
-            return None;
-        }
-        let mut adjusted: Option<Range<usize>> = None;
+    guarded_callback(nil, || {
+        with_input_handler(this, |input_handler| {
+            let range = range.to_range()?;
+            if range.is_empty() {
+                return None;
+            }
+            let mut adjusted: Option<Range<usize>> = None;
 
-        let selected_text = input_handler.text_for_range(range.clone(), &mut adjusted)?;
-        if let Some(adjusted) = adjusted
-            && adjusted != range
-        {
-            unsafe { (actual_range as *mut NSRange).write(NSRange::from(adjusted)) };
-        }
-        unsafe {
-            let string: id = msg_send![class!(NSAttributedString), alloc];
-            let string: id = msg_send![string, initWithString: ns_string(&selected_text)];
-            Some(string)
-        }
+            let selected_text = input_handler.text_for_range(range.clone(), &mut adjusted)?;
+            if let Some(adjusted) = adjusted
+                && adjusted != range
+            {
+                unsafe { (actual_range as *mut NSRange).write(NSRange::from(adjusted)) };
+            }
+            unsafe {
+                let string: id = msg_send![class!(NSAttributedString), alloc];
+                let string: id = msg_send![string, initWithString: ns_string(&selected_text)];
+                Some(string)
+            }
+        })
+        .flatten()
+        .unwrap_or(nil)
     })
-    .flatten()
-    .unwrap_or(nil)
 }
 
 // We ignore which selector it asks us to do because the user may have
 // bound the shortcut to something else.
 extern "C" fn do_command_by_selector(this: &Object, _: Sel, _: Sel) {
-    let state = unsafe { get_window_state(this) };
-    let mut lock = state.as_ref().lock();
-    let keystroke = lock.keystroke_for_do_command.take();
-    let mut event_callback = lock.event_callback.take();
-    drop(lock);
+    guarded_callback((), || {
+        let state = unsafe { get_window_state(this) };
+        let mut lock = state.as_ref().lock();
+        let keystroke = lock.keystroke_for_do_command.take();
+        let mut event_callback = lock.event_callback.take();
+        drop(lock);
 
-    if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
-        let handled = (callback)(PlatformInput::KeyDown(KeyDownEvent {
-            keystroke,
-            is_held: false,
-            prefer_character_input: false,
-        }));
-        state.as_ref().lock().do_command_handled = Some(!handled.propagate);
-    }
+        if let Some((keystroke, callback)) = keystroke.zip(event_callback.as_mut()) {
+            let handled = guarded_callback(false, || {
+                !(callback)(PlatformInput::KeyDown(KeyDownEvent {
+                    keystroke,
+                    is_held: false,
+                    prefer_character_input: false,
+                }))
+                .propagate
+            });
+            state.as_ref().lock().do_command_handled = Some(handled);
+        }
 
-    state.as_ref().lock().event_callback = event_callback;
+        state.as_ref().lock().event_callback = event_callback;
+    })
 }
 
 extern "C" fn view_did_change_effective_appearance(this: &Object, _: Sel) {
-    unsafe {
-        let state = get_window_state(this);
-        let appearance_changed_callback = {
-            let mut lock = state.as_ref().lock();
-            lock.appearance_changed_callback.take()
-        };
+    guarded_callback((), || {
+        unsafe {
+            let state = get_window_state(this);
+            let appearance_changed_callback = {
+                let mut lock = state.as_ref().lock();
+                lock.appearance_changed_callback.take()
+            };
 
-        if let Some(mut callback) = appearance_changed_callback {
-            callback();
-            state.lock().appearance_changed_callback = Some(callback);
+            if let Some(mut callback) = appearance_changed_callback {
+                guarded_callback((), || callback());
+                state.lock().appearance_changed_callback = Some(callback);
+            }
+
+            // AppKit can relayout the standard traffic light buttons as part of
+            // applying a new appearance. Reapply GPUI's custom position after
+            // notifying appearance observers.
+            state.lock().move_traffic_light();
         }
-
-        // AppKit can relayout the standard traffic light buttons as part of
-        // applying a new appearance. Reapply GPUI's custom position after
-        // notifying appearance observers.
-        state.lock().move_traffic_light();
-    }
+    })
 }
 
 extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    lock.first_mouse = true;
-    YES
+    guarded_callback(NO, || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        lock.first_mouse = true;
+        YES
+    })
 }
 
 // Reports which region of the view AppKit should treat as app-owned titlebar content
@@ -3386,24 +3466,31 @@ extern "C" fn accepts_first_mouse(this: &Object, _: Sel, _: id) -> BOOL {
 // This is independent of `NSWindow.isMovable`, so the Window-menu tiling items stay
 // enabled regardless.
 extern "C" fn opaque_rect_for_window_move_when_in_titlebar(this: &Object, _: Sel) -> NSRect {
-    let zero_rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
-    let window_state = unsafe { get_window_state(this) };
-    let app_owns_titlebar_drag = window_state.as_ref().lock().app_owns_titlebar_drag;
-    if app_owns_titlebar_drag {
-        unsafe { msg_send![this, bounds] }
-    } else {
-        zero_rect
-    }
+    guarded_callback(
+        NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+        || {
+            let zero_rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.));
+            let window_state = unsafe { get_window_state(this) };
+            let app_owns_titlebar_drag = window_state.as_ref().lock().app_owns_titlebar_drag;
+            if app_owns_titlebar_drag {
+                unsafe { msg_send![this, bounds] }
+            } else {
+                zero_rect
+            }
+        },
+    )
 }
 
 extern "C" fn character_index_for_point(this: &Object, _: Sel, position: NSPoint) -> u64 {
-    let position = screen_point_to_gpui_point(this, position);
-    with_input_handler(this, |input_handler| {
-        input_handler.character_index_for_point(position)
+    guarded_callback(NSNotFound as u64, || {
+        let position = screen_point_to_gpui_point(this, position);
+        with_input_handler(this, |input_handler| {
+            input_handler.character_index_for_point(position)
+        })
+        .flatten()
+        .map(|index| index as u64)
+        .unwrap_or(NSNotFound as u64)
     })
-    .flatten()
-    .map(|index| index as u64)
-    .unwrap_or(NSNotFound as u64)
 }
 
 fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels> {
@@ -3415,36 +3502,44 @@ fn screen_point_to_gpui_point(this: &Object, position: NSPoint) -> Point<Pixels>
 }
 
 extern "C" fn dragging_entered(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
-    let window_state = unsafe { get_window_state(this) };
-    let position = drag_event_position(&window_state, dragging_info);
-    let paths = external_paths_from_event(dragging_info);
-    if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
-        && send_file_drop_event(window_state, event)
-    {
-        return NSDragOperationCopy;
-    }
-    NSDragOperationNone
+    guarded_callback(NSDragOperationNone, || {
+        let window_state = unsafe { get_window_state(this) };
+        let position = drag_event_position(&window_state, dragging_info);
+        let paths = external_paths_from_event(dragging_info);
+        if let Some(event) = paths.map(|paths| FileDropEvent::Entered { position, paths })
+            && send_file_drop_event(window_state, event)
+        {
+            return NSDragOperationCopy;
+        }
+        NSDragOperationNone
+    })
 }
 
 extern "C" fn dragging_updated(this: &Object, _: Sel, dragging_info: id) -> NSDragOperation {
-    let window_state = unsafe { get_window_state(this) };
-    let position = drag_event_position(&window_state, dragging_info);
-    if send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
-        NSDragOperationCopy
-    } else {
-        NSDragOperationNone
-    }
+    guarded_callback(NSDragOperationNone, || {
+        let window_state = unsafe { get_window_state(this) };
+        let position = drag_event_position(&window_state, dragging_info);
+        if send_file_drop_event(window_state, FileDropEvent::Pending { position }) {
+            NSDragOperationCopy
+        } else {
+            NSDragOperationNone
+        }
+    })
 }
 
 extern "C" fn dragging_exited(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    send_file_drop_event(window_state, FileDropEvent::Exited);
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        send_file_drop_event(window_state, FileDropEvent::Exited);
+    })
 }
 
 extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -> BOOL {
-    let window_state = unsafe { get_window_state(this) };
-    let position = drag_event_position(&window_state, dragging_info);
-    send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
+    guarded_callback(NO, || {
+        let window_state = unsafe { get_window_state(this) };
+        let position = drag_event_position(&window_state, dragging_info);
+        send_file_drop_event(window_state, FileDropEvent::Submit { position }).to_objc()
+    })
 }
 
 fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
@@ -3465,8 +3560,10 @@ fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths
 }
 
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
-    let window_state = unsafe { get_window_state(this) };
-    send_file_drop_event(window_state, FileDropEvent::Exited);
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        send_file_drop_event(window_state, FileDropEvent::Exited);
+    })
 }
 
 async fn synthetic_drag(
@@ -3482,7 +3579,9 @@ async fn synthetic_drag(
             if lock.synthetic_drag_counter == drag_id {
                 if let Some(mut callback) = lock.event_callback.take() {
                     drop(lock);
-                    callback(PlatformInput::MouseMove(event.clone()));
+                    guarded_callback((), || {
+                        callback(PlatformInput::MouseMove(event.clone()));
+                    });
                     window_state.lock().event_callback = Some(callback);
                 }
             } else {
@@ -3507,13 +3606,16 @@ fn send_file_drop_event(
     let mut lock = window_state.lock();
     if let Some(mut callback) = lock.event_callback.take() {
         drop(lock);
-        callback(PlatformInput::FileDrop(file_drop_event));
+        let delivered = guarded_callback(false, || {
+            callback(PlatformInput::FileDrop(file_drop_event));
+            true
+        });
         let mut lock = window_state.lock();
         lock.event_callback = Some(callback);
         if let Some(external_files_dragged) = external_files_dragged {
-            lock.external_files_dragged = external_files_dragged;
+            lock.external_files_dragged = external_files_dragged && delivered;
         }
-        true
+        delivered
     } else {
         false
     }
@@ -3532,9 +3634,9 @@ where
     let mut lock = window_state.as_ref().lock();
     if let Some(mut input_handler) = lock.input_handler.take() {
         drop(lock);
-        let result = f(&mut input_handler);
+        let result = guarded_callback(None, || Some(f(&mut input_handler)));
         window_state.lock().input_handler = Some(input_handler);
-        Some(result)
+        result
     } else {
         None
     }
@@ -3555,42 +3657,46 @@ fn display_id_for_screen(screen: id) -> Option<CGDirectDisplayID> {
 }
 
 extern "C" fn blurred_view_init_with_frame(this: &Object, _: Sel, frame: NSRect) -> id {
-    unsafe {
-        let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
-        // Use a colorless semantic material. The default value `AppearanceBased`, though not
-        // manually set, is deprecated.
-        //
-        // `UnderWindowBackground` rather than `Selection`: on macOS 26+, `Selection` no longer
-        // vends the `CABackdropLayer` that `remove_layer_background` walks, so the view renders
-        // with no blur at all. `UnderWindowBackground` still vends one, and is the material
-        // AppKit documents for the area behind a window's own background.
-        NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
-        // Behind-window blending is what samples the desktop rather than the window's own
-        // content. It is already the default, but this view exists only for that mode.
-        NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
-        NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
-        view
-    }
+    guarded_callback(nil, || {
+        unsafe {
+            let view = msg_send![super(this, class!(NSVisualEffectView)), initWithFrame: frame];
+            // Use a colorless semantic material. The default value `AppearanceBased`, though not
+            // manually set, is deprecated.
+            //
+            // `UnderWindowBackground` rather than `Selection`: on macOS 26+, `Selection` no longer
+            // vends the `CABackdropLayer` that `remove_layer_background` walks, so the view renders
+            // with no blur at all. `UnderWindowBackground` still vends one, and is the material
+            // AppKit documents for the area behind a window's own background.
+            NSVisualEffectView::setMaterial_(view, NSVisualEffectMaterial::UnderWindowBackground);
+            // Behind-window blending is what samples the desktop rather than the window's own
+            // content. It is already the default, but this view exists only for that mode.
+            NSVisualEffectView::setBlendingMode_(view, NSVisualEffectBlendingMode::BehindWindow);
+            NSVisualEffectView::setState_(view, NSVisualEffectState::Active);
+            view
+        }
+    })
 }
 
 extern "C" fn blurred_view_update_layer(this: &Object, _: Sel) {
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
-        let layer: id = msg_send![this, layer];
-        if !layer.is_null() {
-            remove_layer_background(layer);
-            // Fallback base BEHIND the backdrop sublayer. Mission Control and
-            // the Spaces switcher render window SNAPSHOTS, which omit backdrop
-            // layers entirely — with every background stripped above, the
-            // window read as fully transparent glass over the raw desktop
-            // there. An opaque dark root background is covered by the live
-            // blur in normal compositing, but keeps the snapshot reading as a
-            // solid dark surface (how stock vibrancy materials degrade).
-            let black: id = msg_send![class!(NSColor), blackColor];
-            let black_cg: id = msg_send![black, CGColor];
-            let _: () = msg_send![layer, setBackgroundColor: black_cg];
+    guarded_callback((), || {
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSVisualEffectView)), updateLayer];
+            let layer: id = msg_send![this, layer];
+            if !layer.is_null() {
+                remove_layer_background(layer);
+                // Fallback base BEHIND the backdrop sublayer. Mission Control and
+                // the Spaces switcher render window SNAPSHOTS, which omit backdrop
+                // layers entirely — with every background stripped above, the
+                // window read as fully transparent glass over the raw desktop
+                // there. An opaque dark root background is covered by the live
+                // blur in normal compositing, but keeps the snapshot reading as a
+                // solid dark surface (how stock vibrancy materials degrade).
+                let black: id = msg_send![class!(NSColor), blackColor];
+                let black_cg: id = msg_send![black, CGColor];
+                let _: () = msg_send![layer, setBackgroundColor: black_cg];
+            }
         }
-    }
+    })
 }
 
 unsafe fn remove_layer_background(layer: id) {
@@ -3663,68 +3769,74 @@ unsafe fn remove_layer_background(layer: id) {
 }
 
 extern "C" fn add_titlebar_accessory_view_controller(this: &Object, _: Sel, view_controller: id) {
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSWindow)), addTitlebarAccessoryViewController: view_controller];
+    guarded_callback((), || {
+        unsafe {
+            let _: () = msg_send![super(this, class!(NSWindow)), addTitlebarAccessoryViewController: view_controller];
 
-        // Hide the native tab bar and set its height to 0, since we render our own.
-        let accessory_view: id = msg_send![view_controller, view];
-        let _: () = msg_send![accessory_view, setHidden: YES];
-        let mut frame: NSRect = msg_send![accessory_view, frame];
-        frame.size.height = 0.0;
-        let _: () = msg_send![accessory_view, setFrame: frame];
-    }
+            // Hide the native tab bar and set its height to 0, since we render our own.
+            let accessory_view: id = msg_send![view_controller, view];
+            let _: () = msg_send![accessory_view, setHidden: YES];
+            let mut frame: NSRect = msg_send![accessory_view, frame];
+            frame.size.height = 0.0;
+            let _: () = msg_send![accessory_view, setFrame: frame];
+        }
+    })
 }
 
 extern "C" fn move_tab_to_new_window(this: &Object, _: Sel, _: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let _: () = msg_send![super(this, class!(NSWindow)), moveTabToNewWindow:nil];
 
         let window_state = get_window_state(this);
         let mut lock = window_state.as_ref().lock();
         if let Some(mut callback) = lock.move_tab_to_new_window_callback.take() {
             drop(lock);
-            callback();
+            guarded_callback((), || callback());
             window_state.lock().move_tab_to_new_window_callback = Some(callback);
         }
-    }
+    })
 }
 
 extern "C" fn merge_all_windows(this: &Object, _: Sel, _: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let _: () = msg_send![super(this, class!(NSWindow)), mergeAllWindows:nil];
 
         let window_state = get_window_state(this);
         let mut lock = window_state.as_ref().lock();
         if let Some(mut callback) = lock.merge_all_windows_callback.take() {
             drop(lock);
-            callback();
+            guarded_callback((), || callback());
             window_state.lock().merge_all_windows_callback = Some(callback);
         }
-    }
+    })
 }
 
 extern "C" fn select_next_tab(this: &Object, _sel: Sel, _id: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    if let Some(mut callback) = lock.select_next_tab_callback.take() {
-        drop(lock);
-        callback();
-        window_state.lock().select_next_tab_callback = Some(callback);
-    }
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.select_next_tab_callback.take() {
+            drop(lock);
+            guarded_callback((), || callback());
+            window_state.lock().select_next_tab_callback = Some(callback);
+        }
+    })
 }
 
 extern "C" fn select_previous_tab(this: &Object, _sel: Sel, _id: id) {
-    let window_state = unsafe { get_window_state(this) };
-    let mut lock = window_state.as_ref().lock();
-    if let Some(mut callback) = lock.select_previous_tab_callback.take() {
-        drop(lock);
-        callback();
-        window_state.lock().select_previous_tab_callback = Some(callback);
-    }
+    guarded_callback((), || {
+        let window_state = unsafe { get_window_state(this) };
+        let mut lock = window_state.as_ref().lock();
+        if let Some(mut callback) = lock.select_previous_tab_callback.take() {
+            drop(lock);
+            guarded_callback((), || callback());
+            window_state.lock().select_previous_tab_callback = Some(callback);
+        }
+    })
 }
 
 extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
-    unsafe {
+    guarded_callback((), || unsafe {
         let _: () = msg_send![super(this, class!(NSWindow)), toggleTabBar:nil];
 
         let window_state = get_window_state(this);
@@ -3733,10 +3845,10 @@ extern "C" fn toggle_tab_bar(this: &Object, _sel: Sel, _id: id) {
 
         if let Some(mut callback) = lock.toggle_tab_bar_callback.take() {
             drop(lock);
-            callback();
+            guarded_callback((), || callback());
             window_state.lock().toggle_tab_bar_callback = Some(callback);
         }
-    }
+    })
 }
 
 #[cfg(test)]
