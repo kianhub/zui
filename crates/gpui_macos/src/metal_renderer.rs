@@ -567,17 +567,29 @@ impl MetalRenderer {
         // Display-link callbacks need not coincide with an AppKit event-pool
         // drain. Bound temporary encoders/drawables to their submitted frame;
         // Metal retains all resources referenced by in-flight commands.
-        objc::rc::autoreleasepool(|| self.draw_frame(scene));
+        if let Err(error) = objc::rc::autoreleasepool(|| self.draw_frame(scene, false)) {
+            log::error!("failed to draw frame: {error}");
+        }
     }
 
-    fn draw_frame(&mut self, scene: &Scene) {
+    /// Finish rendering before publishing the drawable into the layer's
+    /// transaction. Used only when showing a hidden, prewarmed window; normal
+    /// frames continue to submit asynchronously.
+    pub fn draw_and_wait(&mut self, scene: &Scene) -> Result<()> {
+        let presents_with_transaction = self.presents_with_transaction;
+        self.set_presents_with_transaction(true);
+        let result = objc::rc::autoreleasepool(|| self.draw_frame(scene, true));
+        self.set_presents_with_transaction(presents_with_transaction);
+        result
+    }
+
+    fn draw_frame(&mut self, scene: &Scene, wait_for_completion: bool) -> Result<()> {
         let layer = match &self.layer {
             Some(l) => l.clone(),
             None => {
-                log::error!(
+                anyhow::bail!(
                     "draw() called on headless renderer - use render_scene_to_image() instead"
                 );
-                return;
             }
         };
         let viewport_size = layer.drawable_size();
@@ -588,11 +600,10 @@ impl MetalRenderer {
         let drawable = if let Some(drawable) = layer.next_drawable() {
             drawable
         } else {
-            log::error!(
+            anyhow::bail!(
                 "failed to retrieve next drawable, drawable size: {:?}",
                 viewport_size
             );
-            return;
         };
 
         loop {
@@ -616,7 +627,14 @@ impl MetalRenderer {
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
 
-                    if self.presents_with_transaction {
+                    if wait_for_completion {
+                        command_buffer.commit();
+                        command_buffer.wait_until_completed();
+                        if command_buffer.status() == metal::MTLCommandBufferStatus::Error {
+                            anyhow::bail!("GPU failed to render the window's first frame");
+                        }
+                        drawable.present();
+                    } else if self.presents_with_transaction {
                         command_buffer.commit();
                         command_buffer.wait_until_scheduled();
                         drawable.present();
@@ -624,7 +642,7 @@ impl MetalRenderer {
                         command_buffer.present_drawable(drawable);
                         command_buffer.commit();
                     }
-                    return;
+                    return Ok(());
                 }
                 Err(err) => {
                     log::error!(
@@ -634,8 +652,7 @@ impl MetalRenderer {
                     let mut instance_buffer_pool = self.instance_buffer_pool.lock();
                     let buffer_size = instance_buffer_pool.buffer_size;
                     if buffer_size >= 256 * 1024 * 1024 {
-                        log::error!("instance buffer size grew too large: {}", buffer_size);
-                        break;
+                        anyhow::bail!("instance buffer size grew too large: {}", buffer_size);
                     }
                     instance_buffer_pool.reset(buffer_size * 2);
                     log::info!(

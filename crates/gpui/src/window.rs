@@ -2936,6 +2936,10 @@ impl Window {
             self.rendered_frame.overlay_scene_start,
             self.rendered_frame.overlay_capture_input,
         );
+        self.finish_presentation();
+    }
+
+    fn finish_presentation(&mut self) {
         #[cfg(feature = "input-latency-histogram")]
         self.input_latency_tracker.record_frame_presented();
         self.needs_present.set(false);
@@ -5712,6 +5716,46 @@ impl Window {
     /// Focus the current window and bring it to the foreground at the platform level.
     pub fn activate_window(&self) {
         self.platform_window.activate();
+    }
+
+    /// Render a fresh frame without showing or focusing this window. On macOS
+    /// GPU work finishes before returning; presentation callbacks remain deferred.
+    pub fn prewarm_window(&mut self, cx: &mut App) -> Result<()> {
+        self.refresh();
+        let arena_clear_needed = self.draw(cx);
+        let result = self.platform_window.prepare_frame(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+            self.rendered_frame.overlay_capture_input,
+        );
+        arena_clear_needed.clear();
+        result
+    }
+
+    /// Draw a fresh frame, then show and focus this window. On macOS the GPU
+    /// finishes the frame before the window is ordered onscreen, without
+    /// activating the application.
+    pub fn show_window(&mut self, cx: &mut App) -> Result<()> {
+        self.refresh();
+        let arena_clear_needed = self.draw(cx);
+        for callback in &self.rendered_frame.presentation_callbacks {
+            callback();
+        }
+        let result = self.platform_window.show(
+            &self.rendered_frame.scene,
+            self.rendered_frame.overlay_scene_start,
+            self.rendered_frame.overlay_capture_input,
+        );
+        if result.is_ok() {
+            self.finish_presentation();
+        }
+        arena_clear_needed.clear();
+        result
+    }
+
+    /// Hide this window while keeping its view state available for reuse.
+    pub fn hide_window(&self) {
+        self.platform_window.hide();
     }
 
     /// Requests that the operating system draw attention to this window.

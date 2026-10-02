@@ -620,6 +620,8 @@ struct MacWindowState {
     select_previous_tab_callback: Option<Box<dyn FnMut()>>,
     toggle_tab_bar_callback: Option<Box<dyn FnMut()>>,
     activated_least_once: bool,
+    visible: bool,
+    show_in_progress: bool,
     closed: Arc<AtomicBool>,
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
@@ -756,11 +758,15 @@ impl MacWindowState {
 
     fn start_display_link(&mut self) {
         self.stop_display_link();
+        if !self.visible || self.closed.load(Ordering::Acquire) {
+            return;
+        }
         unsafe {
-            if !self
-                .native_window
-                .occlusionState()
-                .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
+            if self.native_window.isVisible() != YES
+                || !self
+                    .native_window
+                    .occlusionState()
+                    .contains(NSWindowOcclusionState::NSWindowOcclusionStateVisible)
             {
                 return;
             }
@@ -851,6 +857,14 @@ impl MacWindowState {
 unsafe impl Send for MacWindowState {}
 
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
+
+struct ShowInProgress<'a>(&'a Mutex<MacWindowState>);
+
+impl Drop for ShowInProgress<'_> {
+    fn drop(&mut self) {
+        self.0.lock().show_in_progress = false;
+    }
+}
 
 impl MacWindow {
     pub fn open(
@@ -1038,6 +1052,8 @@ impl MacWindow {
                 select_previous_tab_callback: None,
                 toggle_tab_bar_callback: None,
                 activated_least_once: false,
+                visible: show,
+                show_in_progress: false,
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
@@ -1207,6 +1223,155 @@ impl MacWindow {
 
             window
         }
+    }
+
+    fn draw_scene(
+        &self,
+        scene: &gpui::Scene,
+        overlay_start: usize,
+        capture_input: bool,
+        wait_for_completion: bool,
+    ) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        if state.overlay_renderer.is_none() {
+            if wait_for_completion {
+                state.renderer.draw_and_wait(scene)?;
+            } else {
+                state.renderer.draw(scene);
+            }
+            return Ok(());
+        }
+        let split = overlay_start.min(scene.len());
+        let mut base = gpui::Scene::default();
+        base.replay(0..split, scene);
+        base.finish();
+        let mut overlay = gpui::Scene::default();
+        overlay.replay(split..scene.len(), scene);
+        overlay.finish();
+        let visible = !overlay.is_empty();
+        let active = capture_input && visible;
+        let was_active = state.overlay_capture_input.swap(active, Ordering::AcqRel);
+        let focus_chrome = active && !was_active;
+        let size = state.content_size();
+        let scale = state.scale_factor();
+        if state.overlay_size != Some((size, scale)) {
+            let renderer = state
+                .overlay_renderer
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("scene overlay renderer is unavailable"))?;
+            renderer.update_drawable_size(size.to_device_pixels(scale));
+            if let Some(layer) = renderer.layer() {
+                unsafe {
+                    let _: () = msg_send![layer, setContentsScale: scale as f64];
+                }
+            }
+            state.overlay_size = Some((size, scale));
+        }
+        let plane = state
+            .overlay_view
+            .ok_or_else(|| anyhow::anyhow!("scene overlay view is unavailable"))?
+            .as_ptr();
+        // A Metal texture cannot sample pixels from a sibling WKWebView.
+        // AppKit's within-window effects include native content in the blur.
+        // Keep these effect views below GPUI text and above native children.
+        unsafe {
+            while state.overlay_backdrops.len() > overlay.backdrop_blurs.len() {
+                let Some((view, _)) = state.overlay_backdrops.pop() else {
+                    break;
+                };
+                let view = view.as_ptr();
+                let _: () = msg_send![view, removeFromSuperview];
+            }
+            let parent = state.native_view.as_ptr();
+            for (index, blur) in overlay.backdrop_blurs.iter().enumerate() {
+                let view = if let Some((view, _)) = state.overlay_backdrops.get(index) {
+                    view.as_ptr()
+                } else {
+                    let view: id = msg_send![BACKDROP_VIEW_CLASS, alloc];
+                    let view = NSView::initWithFrame_(
+                        view,
+                        NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
+                    );
+                    let view_ptr = NonNull::new(view)
+                        .ok_or_else(|| anyhow::anyhow!("failed to create scene backdrop view"))?;
+                    view.setWantsLayer(YES);
+                    parent.addSubview_(view.autorelease());
+                    state.overlay_backdrops.push((view_ptr, blur.blur_radius.0));
+                    view
+                };
+                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
+                let x = (bounds.origin.x.0 / scale) as f64;
+                let width = (bounds.size.width.0 / scale).max(0.) as f64;
+                let height = (bounds.size.height.0 / scale).max(0.) as f64;
+                let y = f32::from(size.height) as f64 - (bounds.origin.y.0 / scale) as f64 - height;
+                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
+                let _: () = msg_send![view, setFrame: frame];
+                let peak = &mut state.overlay_backdrops[index].1;
+                *peak = peak.max(blur.blur_radius.0);
+                let native_radius = (blur.blur_radius.0 / scale) as f64;
+                let layer: id = msg_send![view, layer];
+                if *(*view).get_ivar::<f64>("blurRadius") != native_radius {
+                    (*view).set_ivar("blurRadius", native_radius);
+                    // Filters are copied into the render tree. Updating a
+                    // nested filter value alone does not invalidate that copy.
+                    let filter: id =
+                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
+                    let radius_value: id =
+                        msg_send![class!(NSNumber), numberWithDouble: native_radius];
+                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
+                    let _: () =
+                        msg_send![filter, setValue: radius_value forKey: ns_string("inputRadius")];
+                    let _: () =
+                        msg_send![filter, setValue: yes forKey: ns_string("inputNormalizeEdges")];
+                    let filters: id = msg_send![class!(NSArray), arrayWithObject: filter];
+                    let _: () = msg_send![layer, setFilters: filters];
+                }
+                let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
+                let _: () = msg_send![view, setAlphaValue: alpha];
+                let layer: id = msg_send![view, layer];
+                let radius = (blur.corner_radii.top_left.0 / scale) as f64;
+                let _: () = msg_send![layer, setCornerRadius: radius];
+                let _: () = msg_send![layer, setMasksToBounds: YES];
+                let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
+            }
+        }
+        // Keep the Metal blur too: overlapping GPUI popovers still need to
+        // blur earlier overlay content, while native effects supply the page.
+        if wait_for_completion {
+            state.renderer.draw_and_wait(&base)?;
+        } else {
+            state.renderer.draw(&base);
+        }
+        if visible {
+            if let Some(renderer) = state.overlay_renderer.as_mut() {
+                if wait_for_completion {
+                    renderer.draw_and_wait(&overlay)?;
+                } else {
+                    renderer.draw(&overlay);
+                }
+            }
+        } else {
+            state
+                .overlay_renderer
+                .as_mut()
+                .ok_or_else(|| anyhow::anyhow!("scene overlay renderer is unavailable"))?
+                .trim_idle_resources();
+        }
+        unsafe {
+            let _: () = msg_send![plane, setHidden: if visible { NO } else { YES }];
+        }
+        let window = state.native_window;
+        let view = state.native_view.as_ptr();
+        drop(state);
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
+        if focus_chrome {
+            unsafe {
+                let _: BOOL = msg_send![window, makeFirstResponder: view];
+            }
+        }
+        Ok(())
     }
 
     pub fn active_window() -> Option<AnyWindowHandle> {
@@ -1601,15 +1766,96 @@ impl PlatformWindow for MacWindow {
         let window = lock.native_window;
         let closed = lock.closed.clone();
         let executor = lock.foreground_executor.clone();
+        let state = self.0.clone();
         executor
             .spawn(async move {
                 if !closed.load(Ordering::Acquire) {
+                    // Native ordering can synchronously invoke window delegates.
+                    // Update visibility and release the state lock first.
+                    state.lock().visible = true;
                     unsafe {
                         let _: () = msg_send![window, makeKeyAndOrderFront: nil];
                     }
                 }
             })
             .detach();
+    }
+
+    fn show(
+        &self,
+        scene: &gpui::Scene,
+        overlay_start: usize,
+        capture_input: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut state = self.0.lock();
+            if state.closed.load(Ordering::Acquire) {
+                anyhow::bail!("cannot show a closed window");
+            }
+            state.stop_display_link();
+            state.show_in_progress = true;
+        }
+        // View rendering and native delegates can unwind into the caller's
+        // panic boundary. A failed show must not block future frame requests.
+        let _show_in_progress = ShowInProgress(&self.0);
+        let result = self.draw_scene(scene, overlay_start, capture_input, true);
+        let window = {
+            let mut state = self.0.lock();
+            if let Err(error) = result {
+                state.start_display_link();
+                return Err(error);
+            }
+            state.visible = true;
+            state.native_window
+        };
+        // AppKit ordering and key changes synchronously call our delegates.
+        // Release WindowState before each message so those delegates can lock it.
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+            let _: () = msg_send![window, orderFrontRegardless];
+            let _: () = msg_send![window, makeKeyWindow];
+        }
+        let mut state = self.0.lock();
+        state.show_in_progress = false;
+        state.start_display_link();
+        Ok(())
+    }
+
+    fn prepare_frame(
+        &self,
+        scene: &gpui::Scene,
+        overlay_start: usize,
+        capture_input: bool,
+    ) -> anyhow::Result<()> {
+        {
+            let mut state = self.0.lock();
+            if state.closed.load(Ordering::Acquire) {
+                anyhow::bail!("cannot prepare a closed window");
+            }
+            state.show_in_progress = true;
+        }
+        // A transaction flush can deliver layer callbacks synchronously.
+        let _show_in_progress = ShowInProgress(&self.0);
+        self.draw_scene(scene, overlay_start, capture_input, true)?;
+        unsafe {
+            let _: () = msg_send![class!(CATransaction), flush];
+        }
+        Ok(())
+    }
+
+    fn hide(&self) {
+        let window = {
+            let mut state = self.0.lock();
+            if state.closed.load(Ordering::Acquire) {
+                return;
+            }
+            state.visible = false;
+            state.stop_display_link();
+            state.native_window
+        };
+        unsafe {
+            let _: () = msg_send![window, orderOut: nil];
+        }
     }
 
     fn request_attention(&self) {
@@ -1942,123 +2188,8 @@ impl PlatformWindow for MacWindow {
     }
 
     fn draw_layered(&self, scene: &gpui::Scene, overlay_start: usize, capture_input: bool) {
-        let mut state = self.0.lock();
-        if state.overlay_renderer.is_none() {
-            state.renderer.draw(scene);
-            return;
-        }
-        let split = overlay_start.min(scene.len());
-        let mut base = gpui::Scene::default();
-        base.replay(0..split, scene);
-        base.finish();
-        let mut overlay = gpui::Scene::default();
-        overlay.replay(split..scene.len(), scene);
-        overlay.finish();
-        let visible = !overlay.is_empty();
-        let active = capture_input && visible;
-        let was_active = state.overlay_capture_input.swap(active, Ordering::AcqRel);
-        let focus_chrome = active && !was_active;
-        let size = state.content_size();
-        let scale = state.scale_factor();
-        if state.overlay_size != Some((size, scale)) {
-            let renderer = state.overlay_renderer.as_mut().unwrap();
-            renderer.update_drawable_size(size.to_device_pixels(scale));
-            if let Some(layer) = renderer.layer() {
-                unsafe {
-                    let _: () = msg_send![layer, setContentsScale: scale as f64];
-                }
-            }
-            state.overlay_size = Some((size, scale));
-        }
-        // A Metal texture cannot sample pixels from a sibling WKWebView.
-        // AppKit's within-window effects include native content in the blur.
-        // Keep these effect views below GPUI text and above native children.
-        unsafe {
-            while state.overlay_backdrops.len() > overlay.backdrop_blurs.len() {
-                let view = state.overlay_backdrops.pop().unwrap().0.as_ptr();
-                let _: () = msg_send![view, removeFromSuperview];
-            }
-            let parent = state.native_view.as_ptr();
-            let plane = state.overlay_view.unwrap().as_ptr();
-            for (index, blur) in overlay.backdrop_blurs.iter().enumerate() {
-                let view = if let Some((view, _)) = state.overlay_backdrops.get(index) {
-                    view.as_ptr()
-                } else {
-                    let view: id = msg_send![BACKDROP_VIEW_CLASS, alloc];
-                    let view = NSView::initWithFrame_(
-                        view,
-                        NSRect::new(NSPoint::new(0., 0.), NSSize::new(0., 0.)),
-                    );
-                    view.setWantsLayer(YES);
-                    parent.addSubview_(view.autorelease());
-                    state
-                        .overlay_backdrops
-                        .push((NonNull::new(view).unwrap(), blur.blur_radius.0));
-                    view
-                };
-                let bounds = blur.bounds.intersect(&blur.content_mask.bounds);
-                let x = (bounds.origin.x.0 / scale) as f64;
-                let width = (bounds.size.width.0 / scale).max(0.) as f64;
-                let height = (bounds.size.height.0 / scale).max(0.) as f64;
-                let y = f32::from(size.height) as f64 - (bounds.origin.y.0 / scale) as f64 - height;
-                let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
-                let _: () = msg_send![view, setFrame: frame];
-                let peak = &mut state.overlay_backdrops[index].1;
-                *peak = peak.max(blur.blur_radius.0);
-                let native_radius = (blur.blur_radius.0 / scale) as f64;
-                let layer: id = msg_send![view, layer];
-                if *(*view).get_ivar::<f64>("blurRadius") != native_radius {
-                    (*view).set_ivar("blurRadius", native_radius);
-                    // Filters are copied into the render tree. Updating a
-                    // nested filter value alone does not invalidate that copy.
-                    let filter: id =
-                        msg_send![class!(CAFilter), filterWithType: ns_string("gaussianBlur")];
-                    let radius_value: id =
-                        msg_send![class!(NSNumber), numberWithDouble: native_radius];
-                    let yes: id = msg_send![class!(NSNumber), numberWithBool: YES];
-                    let _: () =
-                        msg_send![filter, setValue: radius_value forKey: ns_string("inputRadius")];
-                    let _: () =
-                        msg_send![filter, setValue: yes forKey: ns_string("inputNormalizeEdges")];
-                    let filters: id = msg_send![class!(NSArray), arrayWithObject: filter];
-                    let _: () = msg_send![layer, setFilters: filters];
-                }
-                let alpha = (blur.blur_radius.0 / peak.max(1.0)).clamp(0.0, 1.0) as f64;
-                let _: () = msg_send![view, setAlphaValue: alpha];
-                let layer: id = msg_send![view, layer];
-                let radius = (blur.corner_radii.top_left.0 / scale) as f64;
-                let _: () = msg_send![layer, setCornerRadius: radius];
-                let _: () = msg_send![layer, setMasksToBounds: YES];
-                let _: () = msg_send![parent, addSubview: view positioned: NSWindowOrderingMode::NSWindowBelow relativeTo: plane];
-            }
-        }
-        // Keep the Metal blur too: overlapping GPUI popovers still need to
-        // blur earlier overlay content, while native effects supply the page.
-        state.renderer.draw(&base);
-        if visible {
-            state.overlay_renderer.as_mut().unwrap().draw(&overlay);
-        } else {
-            state
-                .overlay_renderer
-                .as_mut()
-                .unwrap()
-                .trim_idle_resources();
-        }
-        unsafe {
-            let view = state.overlay_view.unwrap().as_ptr();
-            let _: () = msg_send![view, setHidden: if visible { NO } else { YES }];
-        }
-        let window = state.native_window;
-        let view = state.native_view.as_ptr();
-        drop(state);
-        unsafe {
-            let _: () = msg_send![class!(CATransaction), flush];
-        }
-        if focus_chrome {
-            unsafe {
-                let _: BOOL = msg_send![window, makeFirstResponder: view];
-            }
-        }
+        self.draw_scene(scene, overlay_start, capture_input, false)
+            .log_err();
     }
 
     fn enable_scene_overlay(&self) -> anyhow::Result<()> {
@@ -2901,7 +3032,7 @@ extern "C" fn window_did_change_key_status(this: &Object, selector: Sel, _: id) 
         let window_state = unsafe { get_window_state(this) };
         let mut lock = window_state.lock();
 
-        if lock.activated_least_once {
+        if lock.activated_least_once && !lock.show_in_progress {
             if let Some(mut callback) = lock.request_frame_callback.take() {
                 lock.set_presents_with_transaction(true);
                 lock.stop_display_link();
@@ -3016,6 +3147,9 @@ extern "C" fn set_frame_size(this: &Object, _: Sel, size: NSSize) {
 extern "C" fn display_layer(this: &Object, _: Sel, _: id) {
     let window_state = unsafe { get_window_state(this) };
     let mut lock = window_state.lock();
+    if !lock.visible || lock.show_in_progress || lock.closed.load(Ordering::Acquire) {
+        return;
+    }
     if let Some(mut callback) = lock.request_frame_callback.take() {
         lock.set_presents_with_transaction(true);
         lock.stop_display_link();
@@ -3033,6 +3167,15 @@ extern "C" fn step(view: *mut c_void) {
     let view = view as id;
     let window_state = unsafe { get_window_state(&*view) };
     let mut lock = window_state.lock();
+    // A queued display-link delivery may arrive after orderOut stopped its
+    // subscription. Never revive rendering for a hidden or closed window.
+    if !lock.visible
+        || lock.show_in_progress
+        || lock.closed.load(Ordering::Acquire)
+        || !lock.frame_requested.load(Ordering::Acquire)
+    {
+        return;
+    }
 
     if let Some(mut callback) = lock.request_frame_callback.take() {
         drop(lock);

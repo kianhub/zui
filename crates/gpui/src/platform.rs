@@ -827,6 +827,25 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
         answers: &[PromptButton],
     ) -> Option<oneshot::Receiver<usize>>;
     fn activate(&self);
+    /// Prepare the supplied frame without changing this window's visibility or focus.
+    fn prepare_frame(
+        &self,
+        scene: &Scene,
+        overlay_start: usize,
+        capture_input: bool,
+    ) -> Result<()> {
+        self.draw_layered(scene, overlay_start, capture_input);
+        Ok(())
+    }
+    /// Present the supplied frame and show this window. Platforms that support
+    /// non-activating panels must not activate the application here.
+    fn show(&self, scene: &Scene, overlay_start: usize, capture_input: bool) -> Result<()> {
+        self.draw_layered(scene, overlay_start, capture_input);
+        self.activate();
+        Ok(())
+    }
+    /// Hide this window without destroying it. Unsupported platforms do nothing.
+    fn hide(&self) {}
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;
