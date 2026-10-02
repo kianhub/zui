@@ -1548,9 +1548,16 @@ impl Window {
             let next_frame_callbacks = next_frame_callbacks.clone();
             let input_rate_tracker = input_rate_tracker.clone();
             move |request_frame_options| {
-                let thermal_state = handle
-                    .update(&mut cx, |_, _, cx| cx.thermal_state())
+                let frame_state = handle
+                    .update(&mut cx, |_, window, cx| {
+                        (cx.thermal_state(), window.platform_window.is_active())
+                    })
                     .log_err();
+                // Key notifications update `active` asynchronously. Query the
+                // native window too: a non-activating key panel must never pay
+                // the inactive-window cap while that notification is queued.
+                let native_key = frame_state.as_ref().is_some_and(|(_, key)| *key);
+                let thermal_state = frame_state.map(|(thermal, _)| thermal);
 
                 // Throttle frame rate based on conditions:
                 // - Thermal pressure (Serious/Critical): cap to ~60fps
@@ -1560,7 +1567,7 @@ impl Window {
                     && next_frame_callbacks.borrow().is_empty()
                 {
                     None
-                } else if !active.get() {
+                } else if !active.get() && !native_key {
                     Some(Duration::from_micros(33333))
                 } else if let Some(ThermalState::Critical | ThermalState::Serious) = thermal_state {
                     Some(Duration::from_micros(16667))
