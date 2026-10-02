@@ -11,7 +11,7 @@ use gpui::{
     MonochromeSprite, PaintSurface, Path, Point, PolychromeSprite, PrimitiveBatch, Quad,
     ScaledPixels, Scene, Shadow, Size, Surface, Underline, point, size,
 };
-use gpui_util::guarded_callback;
+use gpui_util::{GuardedDrop, guarded_callback};
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 
@@ -31,7 +31,16 @@ use objc::{self, class, msg_send, sel, sel_impl};
 unsafe extern "C" {}
 use parking_lot::Mutex;
 
-use std::{cell::Cell, ffi::c_void, mem, ptr, sync::Arc};
+use std::{
+    cell::Cell,
+    ffi::c_void,
+    mem, ptr,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant},
+};
 
 // Exported to metal
 pub(crate) type PointF = gpui::Point<f32>;
@@ -52,6 +61,19 @@ const SCRATCH_RELEASE_AFTER_FRAMES: u32 = 30;
 
 pub(crate) type Context = Arc<Mutex<InstanceBufferPool>>;
 pub(crate) type Renderer = MetalRenderer;
+
+type FramePresentedCallback = Box<dyn FnOnce(f64) + Send + 'static>;
+type PendingFramePresentation = Arc<Mutex<GuardedDrop<Option<FramePresentedCallback>>>>;
+
+const SHOW_PRESENTATION_LIMIT: Duration = Duration::from_millis(500);
+
+/// Every show uses the same bounded presentation flight, independently of
+/// optional observation. Native callbacks own only this generation's atomics.
+struct ShowPresentation {
+    active: AtomicBool,
+    ordered_at: AtomicU64,
+    started_at: Instant,
+}
 
 pub(crate) unsafe fn new_renderer(
     context: self::Context,
@@ -154,6 +176,8 @@ pub(crate) struct MetalRenderer {
     /// For headless rendering, tracks whether output should be opaque
     opaque: bool,
     command_queue: CommandQueue,
+    pending_frame_presentation: Option<PendingFramePresentation>,
+    pending_show_presentation: Option<Arc<ShowPresentation>>,
     paths_rasterization_pipeline_state: metal::RenderPipelineState,
     path_sprites_pipeline_state: metal::RenderPipelineState,
     shadows_pipeline_state: metal::RenderPipelineState,
@@ -205,6 +229,9 @@ impl BackdropTextures {
 
 impl Drop for MetalRenderer {
     fn drop(&mut self) {
+        self.cancel_show_presentation();
+        let cancelled = self.observe_next_frame_presentation(None);
+        guarded_callback((), || drop(cancelled));
         // The MPS kernel is a manually-retained ObjC object; everything else
         // releases through metal-rs wrappers.
         self.release_backdrop_resources();
@@ -427,6 +454,8 @@ impl MetalRenderer {
             is_unified_memory,
             opaque,
             command_queue,
+            pending_frame_presentation: None,
+            pending_show_presentation: None,
             paths_rasterization_pipeline_state,
             path_sprites_pipeline_state,
             shadows_pipeline_state,
@@ -564,6 +593,76 @@ impl MetalRenderer {
         // nothing to do
     }
 
+    pub fn observe_next_frame_presentation(
+        &mut self,
+        callback: Option<FramePresentedCallback>,
+    ) -> Option<FramePresentedCallback> {
+        // Cancel callbacks already copied into in-flight native blocks. The
+        // window releases returned user captures after unlocking its state.
+        let previous = self
+            .pending_frame_presentation
+            .take()
+            .and_then(|pending| pending.lock().take());
+        self.pending_frame_presentation =
+            callback.map(|callback| Arc::new(Mutex::new(GuardedDrop::new(Some(callback)))));
+        previous
+    }
+
+    pub fn begin_show_presentation(&mut self) {
+        self.cancel_show_presentation();
+        if self.pending_frame_presentation.is_some() {
+            // Move the callback into a fresh slot so earlier non-show blocks
+            // cannot consume a pre-order acknowledgement during this show.
+            // The first call empties every old capture; the second replaces
+            // None, so it cannot drop a user callback under WindowState.
+            let callback = self.observe_next_frame_presentation(None);
+            let _ = self.observe_next_frame_presentation(callback);
+        }
+        self.pending_show_presentation = Some(Arc::new(ShowPresentation {
+            active: AtomicBool::new(true),
+            ordered_at: AtomicU64::new(0),
+            started_at: Instant::now(),
+        }));
+    }
+
+    /// Fence actual drawable timestamps after native ordering has completed.
+    /// This deliberately excludes acknowledgements during AppKit ordering;
+    /// the first eligible acknowledgement is a conservative visible bound.
+    pub fn mark_show_ordered(&mut self, ordered_at: f64) {
+        if ordered_at.is_finite() && ordered_at > 0.0 {
+            if let Some(pending) = self.pending_show_presentation.as_ref() {
+                pending
+                    .ordered_at
+                    .store(ordered_at.to_bits(), Ordering::Release);
+            }
+        } else {
+            self.cancel_show_presentation();
+        }
+    }
+
+    pub fn cancel_show_presentation(&mut self) {
+        if let Some(pending) = self.pending_show_presentation.take() {
+            pending.active.store(false, Ordering::Release);
+        }
+    }
+
+    /// Keep only the existing frame source running while a normal show still
+    /// needs a visible drawable. Expiration is checked at its next frame tick;
+    /// no timer or polling source is created, and observation never drives it.
+    pub fn requires_show_presentation(&mut self) -> bool {
+        let required = self
+            .pending_show_presentation
+            .as_ref()
+            .is_some_and(|pending| {
+                pending.active.load(Ordering::Acquire)
+                    && pending.started_at.elapsed() < SHOW_PRESENTATION_LIMIT
+            });
+        if !required {
+            self.cancel_show_presentation();
+        }
+        required
+    }
+
     pub fn draw(&mut self, scene: &Scene) {
         // Display-link callbacks need not coincide with an AppKit event-pool
         // drain. Bound temporary encoders/drawables to their submitted frame;
@@ -625,6 +724,64 @@ impl MetalRenderer {
                     });
                     let block = block.copy();
                     command_buffer.add_completed_handler(&block);
+
+                    if self
+                        .pending_frame_presentation
+                        .as_ref()
+                        .is_some_and(|pending| pending.lock().is_none())
+                    {
+                        self.pending_frame_presentation = None;
+                    }
+                    self.requires_show_presentation();
+                    let show = self.pending_show_presentation.clone();
+                    let pending = self
+                        .pending_frame_presentation
+                        .as_ref()
+                        .map(|pending| GuardedDrop::new(Arc::clone(pending)));
+                    if show.is_some() || pending.is_some() {
+                        // Normal and measured shows register the same handler.
+                        // A skipped or pre-order drawable leaves the flight and
+                        // passive observer available for a visible submission.
+                        let presented =
+                            ConcreteBlock::new(move |drawable: *mut objc::runtime::Object| {
+                                guarded_callback((), || {
+                                    let Some(drawable) = (unsafe { drawable.as_ref() }) else {
+                                        return;
+                                    };
+                                    // SAFETY: Metal supplies this live MTLDrawable
+                                    // to its presentation handler.
+                                    let presented_time: f64 =
+                                        unsafe { msg_send![drawable, presentedTime] };
+                                    if !presented_time.is_finite() || presented_time <= 0.0 {
+                                        return;
+                                    }
+                                    if let Some(show) = show.as_ref() {
+                                        let ordered_at =
+                                            f64::from_bits(show.ordered_at.load(Ordering::Acquire));
+                                        if ordered_at <= 0.0
+                                            || !ordered_at.is_finite()
+                                            || presented_time < ordered_at
+                                            || show.started_at.elapsed() >= SHOW_PRESENTATION_LIMIT
+                                            || !show.active.swap(false, Ordering::AcqRel)
+                                        {
+                                            return;
+                                        }
+                                    }
+                                    let callback =
+                                        pending.as_ref().and_then(|pending| pending.lock().take());
+                                    if let Some(callback) = callback {
+                                        callback(presented_time);
+                                    }
+                                });
+                            })
+                            .copy();
+                        // SAFETY: Metal copies the block until presentation or
+                        // disposal. Its body and user capture destruction are
+                        // guarded against unwinding through native code.
+                        unsafe {
+                            let _: () = msg_send![drawable, addPresentedHandler: &*presented];
+                        }
+                    }
 
                     if wait_for_completion {
                         command_buffer.commit();

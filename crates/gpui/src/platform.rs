@@ -846,6 +846,19 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     }
     /// Hide this window without destroying it. Unsupported platforms do nothing.
     fn hide(&self) {}
+    /// Observe an eligible drawable presentation acknowledgement in Core
+    /// Animation host time, which may be a conservative bound on visibility.
+    /// The callback may run off the main thread. Skipped/pre-order frames do
+    /// not consume an observer participating in a macOS show.
+    /// Passing None cancels the pending observer. Unsupported platforms return
+    /// false without scheduling work.
+    fn observe_next_frame_presentation(
+        &self,
+        callback: Option<Box<dyn FnOnce(f64) + Send + 'static>>,
+    ) -> bool {
+        gpui_util::guarded_callback((), || drop(callback));
+        false
+    }
     /// Requests that the operating system draw attention to this window.
     fn request_attention(&self) {}
     fn is_active(&self) -> bool;

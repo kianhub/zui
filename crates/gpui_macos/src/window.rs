@@ -73,6 +73,13 @@ use std::{
     time::Duration,
 };
 
+// Keep host-only declarations outside metal_renderer.rs, which cbindgen
+// includes in the shader header; Metal does not support double precision.
+#[link(name = "QuartzCore", kind = "framework")]
+unsafe extern "C" {
+    fn CACurrentMediaTime() -> f64;
+}
+
 const WINDOW_STATE_IVAR: &str = "windowState";
 const OVERLAY_INPUT_IVAR: &str = "overlayInputActive";
 
@@ -863,11 +870,15 @@ unsafe impl Send for MacWindowState {}
 
 pub(crate) struct MacWindow(Arc<Mutex<MacWindowState>>);
 
-struct ShowInProgress<'a>(&'a Mutex<MacWindowState>);
+struct ShowInProgress<'a>(&'a Mutex<MacWindowState>, bool);
 
 impl Drop for ShowInProgress<'_> {
     fn drop(&mut self) {
-        self.0.lock().show_in_progress = false;
+        let mut state = self.0.lock();
+        if self.1 && state.show_in_progress {
+            state.renderer.cancel_show_presentation();
+        }
+        state.show_in_progress = false;
     }
 }
 
@@ -1483,6 +1494,12 @@ impl MacWindow {
 
 impl Drop for MacWindow {
     fn drop(&mut self) {
+        let cancelled = {
+            let mut state = self.0.lock();
+            state.renderer.cancel_show_presentation();
+            state.renderer.observe_next_frame_presentation(None)
+        };
+        guarded_callback((), || drop(cancelled));
         let mut this = self.0.lock();
         this.renderer.destroy();
         if let Some(renderer) = &this.overlay_renderer {
@@ -1810,14 +1827,16 @@ impl PlatformWindow for MacWindow {
             }
             state.stop_display_link();
             state.show_in_progress = true;
+            state.renderer.begin_show_presentation();
         }
         // View rendering and native delegates can unwind into the caller's
         // panic boundary. A failed show must not block future frame requests.
-        let _show_in_progress = ShowInProgress(&self.0);
+        let _show_in_progress = ShowInProgress(&self.0, true);
         let result = self.draw_scene(scene, overlay_start, capture_input, true);
         let window = {
             let mut state = self.0.lock();
             if let Err(error) = result {
+                state.renderer.cancel_show_presentation();
                 state.start_display_link();
                 return Err(error);
             }
@@ -1831,7 +1850,10 @@ impl PlatformWindow for MacWindow {
             let _: () = msg_send![window, orderFrontRegardless];
             let _: () = msg_send![window, makeKeyWindow];
         }
+        // SAFETY: QuartzCore returns the host clock used by presentedTime.
+        let ordered_at = unsafe { CACurrentMediaTime() };
         let mut state = self.0.lock();
+        state.renderer.mark_show_ordered(ordered_at);
         state.show_in_progress = false;
         state.start_display_link();
         Ok(())
@@ -1851,7 +1873,7 @@ impl PlatformWindow for MacWindow {
             state.show_in_progress = true;
         }
         // A transaction flush can deliver layer callbacks synchronously.
-        let _show_in_progress = ShowInProgress(&self.0);
+        let _show_in_progress = ShowInProgress(&self.0, false);
         self.draw_scene(scene, overlay_start, capture_input, true)?;
         unsafe {
             let _: () = msg_send![class!(CATransaction), flush];
@@ -1860,18 +1882,42 @@ impl PlatformWindow for MacWindow {
     }
 
     fn hide(&self) {
-        let window = {
+        let (window, cancelled_presentation) = {
             let mut state = self.0.lock();
             if state.closed.load(Ordering::Acquire) {
                 return;
             }
             state.visible = false;
             state.stop_display_link();
-            state.native_window
+            state.renderer.cancel_show_presentation();
+            let cancelled = state.renderer.observe_next_frame_presentation(None);
+            (state.native_window, cancelled)
         };
+        // User capture destructors may re-enter framework code. Release them
+        // outside WindowState's lock and contain panics at native boundaries.
+        guarded_callback((), || drop(cancelled_presentation));
         unsafe {
             let _: () = msg_send![window, orderOut: nil];
         }
+    }
+
+    fn observe_next_frame_presentation(
+        &self,
+        callback: Option<Box<dyn FnOnce(f64) + Send + 'static>>,
+    ) -> bool {
+        let previous = {
+            let mut state = self.0.lock();
+            if state.closed.load(Ordering::Acquire) {
+                let cancelled = state.renderer.observe_next_frame_presentation(None);
+                drop(state);
+                guarded_callback((), || drop(callback));
+                guarded_callback((), || drop(cancelled));
+                return false;
+            }
+            state.renderer.observe_next_frame_presentation(callback)
+        };
+        guarded_callback((), || drop(previous));
+        true
     }
 
     fn request_attention(&self) {
@@ -2104,6 +2150,12 @@ impl PlatformWindow for MacWindow {
 
     fn pause_frame_requests(&self) {
         let mut state = self.0.lock();
+        if state.visible
+            && !state.closed.load(Ordering::Acquire)
+            && state.renderer.requires_show_presentation()
+        {
+            return;
+        }
         state.frame_requested.store(false, Ordering::Release);
         state.stop_display_link();
         state.renderer.trim_idle_resources();
@@ -3126,12 +3178,15 @@ extern "C" fn window_should_close(this: &Object, _: Sel, _: id) -> BOOL {
 
 extern "C" fn close_window(this: &Object, _: Sel) {
     guarded_callback((), || unsafe {
-        let close_callback = {
+        let (close_callback, cancelled_presentation) = {
             let window_state = get_window_state(this);
             let mut lock = window_state.as_ref().lock();
             lock.closed.store(true, Ordering::Release);
-            lock.close_callback.take()
+            lock.renderer.cancel_show_presentation();
+            let cancelled = lock.renderer.observe_next_frame_presentation(None);
+            (lock.close_callback.take(), cancelled)
         };
+        guarded_callback((), || drop(cancelled_presentation));
 
         if let Some(callback) = close_callback {
             guarded_callback((), || callback());
@@ -3242,8 +3297,12 @@ extern "C" fn step(view: *mut c_void) {
         }
 
         if let Some(mut callback) = lock.request_frame_callback.take() {
+            let options = RequestFrameOptions {
+                require_presentation: lock.renderer.requires_show_presentation(),
+                force_render: false,
+            };
             drop(lock);
-            guarded_callback((), || callback(Default::default()));
+            guarded_callback((), || callback(options));
             window_state.lock().request_frame_callback = Some(callback);
         }
     })

@@ -3662,8 +3662,8 @@ impl Window {
                 .min(((fade.bounds.bottom().0 - center.y.0) / fade.bottom_band()).clamp(0.0, 1.0));
         }
         if fade.left {
-            ramp = ramp
-                .min(((center.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
+            ramp =
+                ramp.min(((center.x.0 - fade.bounds.left().0) / fade.left_band()).clamp(0.0, 1.0));
         }
         if fade.right {
             ramp = ramp
@@ -5763,6 +5763,24 @@ impl Window {
     /// Hide this window while keeping its view state available for reuse.
     pub fn hide_window(&self) {
         self.platform_window.hide();
+    }
+
+    /// Observe an acknowledged drawable presentation in Core Animation host
+    /// time, unlike render-completion callbacks or display-link predictions.
+    /// For macOS shows, only timestamps after native ordering has completed
+    /// are eligible. Native callback delivery can reorder acknowledgements;
+    /// this is a conservative bound, not proof of the earliest displayed frame.
+    /// The callback may run off the main thread and must not touch UI state.
+    ///
+    /// Passing None cancels a pending observer; replacement also cancels the
+    /// previous observer. Returns false if the platform does not support it.
+    /// Keep a bounded timeout, because a hidden/dropped frame may never present.
+    pub fn observe_next_frame_presentation(
+        &self,
+        callback: Option<Box<dyn FnOnce(f64) + Send + 'static>>,
+    ) -> bool {
+        self.platform_window
+            .observe_next_frame_presentation(callback)
     }
 
     /// Requests that the operating system draw attention to this window.
