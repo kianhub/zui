@@ -220,6 +220,13 @@ impl Application {
         self
     }
 
+    /// Override the macOS activation policy before `run`. Without an override,
+    /// macOS honors the bundle's `LSUIElement` and `LSBackgroundOnly` keys.
+    pub fn with_activation_policy(self, policy: crate::ActivationPolicy) -> Self {
+        self.0.borrow().platform.set_activation_policy(policy);
+        self
+    }
+
     /// Start the application. The provided callback will be called once the
     /// app is fully launched.
     pub fn run<F>(self, on_finish_launching: F)

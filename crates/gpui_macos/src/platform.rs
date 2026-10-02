@@ -7,7 +7,11 @@ use anyhow::{Context as _, anyhow};
 use block::ConcreteBlock;
 use cocoa::{
     appkit::{
-        NSApplication, NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular,
+        NSApplication,
+        NSApplicationActivationPolicy::{
+            NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyProhibited,
+            NSApplicationActivationPolicyRegular,
+        },
         NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
         NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
@@ -169,6 +173,7 @@ unsafe fn build_classes() {
 pub struct MacPlatform(Mutex<MacPlatformState>);
 
 pub(crate) struct MacPlatformState {
+    activation_policy: Option<gpui::ActivationPolicy>,
     background_executor: BackgroundExecutor,
     foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
@@ -217,6 +222,7 @@ impl MacPlatform {
         let keyboard_mapper = Rc::new(MacKeyboardMapper::new(keyboard_layout.id()));
 
         Self(Mutex::new(MacPlatformState {
+            activation_policy: None,
             headless,
             text_system,
             background_executor: BackgroundExecutor::new(dispatcher.clone()),
@@ -479,6 +485,10 @@ impl MacPlatform {
 }
 
 impl Platform for MacPlatform {
+    fn set_activation_policy(&self, policy: gpui::ActivationPolicy) {
+        self.0.lock().activation_policy = Some(policy);
+    }
+
     fn background_executor(&self) -> BackgroundExecutor {
         self.0.lock().background_executor.clone()
     }
@@ -1254,7 +1264,27 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
         let app: id = msg_send![APP_CLASS, sharedApplication];
-        app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+        let explicit_policy = get_mac_platform(this).0.lock().activation_policy;
+        let policy = match explicit_policy {
+            Some(gpui::ActivationPolicy::Regular) => NSApplicationActivationPolicyRegular,
+            Some(gpui::ActivationPolicy::Accessory) => NSApplicationActivationPolicyAccessory,
+            Some(gpui::ActivationPolicy::Prohibited) => NSApplicationActivationPolicyProhibited,
+            None => {
+                let bundle: id = NSBundle::mainBundle();
+                let background: id =
+                    msg_send![bundle, objectForInfoDictionaryKey: ns_string("LSBackgroundOnly")];
+                let accessory: id =
+                    msg_send![bundle, objectForInfoDictionaryKey: ns_string("LSUIElement")];
+                if background != nil && msg_send![background, boolValue] {
+                    NSApplicationActivationPolicyProhibited
+                } else if accessory != nil && msg_send![accessory, boolValue] {
+                    NSApplicationActivationPolicyAccessory
+                } else {
+                    NSApplicationActivationPolicyRegular
+                }
+            }
+        };
+        app.setActivationPolicy_(policy);
 
         let notification_center: *mut Object =
             msg_send![class!(NSNotificationCenter), defaultCenter];

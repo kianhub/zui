@@ -121,8 +121,22 @@ pub fn guess_compositor() -> &'static str {
     }
 }
 
+/// The macOS application's participation in the Dock and application switching.
+/// Other platforms ignore this policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    /// A normal application with a Dock icon and menu bar.
+    Regular,
+    /// An agent application without a Dock icon or application menu bar.
+    Accessory,
+    /// A background application that cannot activate or display windows.
+    Prohibited,
+}
+
 #[expect(missing_docs)]
 pub trait Platform: 'static {
+    /// Override the bundle's activation policy before starting the application.
+    fn set_activation_policy(&self, _policy: ActivationPolicy) {}
     fn background_executor(&self) -> BackgroundExecutor;
     fn foreground_executor(&self) -> ForegroundExecutor;
     fn text_system(&self) -> Arc<dyn PlatformTextSystem>;
